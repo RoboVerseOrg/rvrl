@@ -1,0 +1,5 @@
+[tool.ruff]
+line-length = 120
+format.preview = true
+lint.preview = false
+target-version = "py38"
