@@ -151,18 +151,12 @@ def main():
 
             obs = obss[t + 1]
 
-            if "final_info" in infos:
-                episode_returns = []
-                episode_lengths = []
-                for info in infos["final_info"]:
-                    if info and "episode" in info:
-                        episode_returns.append(info["episode"]["r"])
-                        episode_lengths.append(info["episode"]["l"])
-                        print(f"global_step={global_step}, episode_return={info['episode']['r']}")
-                writer.add_scalar("charts/episodic_return_mean", np.mean(episode_returns), global_step)
-                writer.add_scalar("charts/episodic_return_min", np.min(episode_returns), global_step)
-                writer.add_scalar("charts/episodic_return_max", np.max(episode_returns), global_step)
-                writer.add_scalar("charts/episodic_length_mean", np.mean(episode_lengths), global_step)
+            if "episode" in infos:
+                writer.add_scalar("charts/episodic_return_mean", infos["episode"]["r"].mean(), global_step)
+                writer.add_scalar("charts/episodic_return_min", infos["episode"]["r"].min(), global_step)
+                writer.add_scalar("charts/episodic_return_max", infos["episode"]["r"].max(), global_step)
+                writer.add_scalar("charts/episodic_length_mean", infos["episode"]["l"].float().mean(), global_step)
+                print(f"global_step={global_step}, episode_return={infos['episode']['r'].mean()}")
 
         values[args.num_steps] = agent.get_value(obss[args.num_steps]).view(-1)
 

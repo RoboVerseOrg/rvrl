@@ -3,6 +3,7 @@
 import gymnasium as gym
 
 from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
+from src.wrapper.record_episode_statistic_tensor import RecordEpisodeStatisticsTensor
 
 
 ## Used for DMControl
@@ -14,7 +15,7 @@ def make_env(env_id, idx, capture_video, run_name):
         else:
             env = gym.make(env_id)
         env = gym.wrappers.FlattenObservation(env)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
+        # env = gym.wrappers.RecordEpisodeStatistics(env)
 
         #! below are important
         # env = gym.wrappers.ClipAction(env)
@@ -50,6 +51,7 @@ def create_vector_env(
         env_fns = [make_env(env_id, i, capture_video and i == 0, run_name, **kwargs) for i in range(num_envs)]
         envs = gym.vector.SyncVectorEnv(env_fns)
         envs = NumpyToTorch(envs, device)
+        envs = RecordEpisodeStatisticsTensor(envs)
         return envs
 
     elif env_id.startswith("Isaac-"):
