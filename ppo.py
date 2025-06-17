@@ -16,6 +16,9 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+# Import our unified environment interface
+from src.envs import create_vector_env
+
 
 @dataclass
 class Args:
@@ -31,6 +34,8 @@ class Args:
     epochs: int = 10
     total_timesteps: int = 1000000
     anneal_lr: bool = True
+    device: str = "cuda"  # Device for IsaacLab environments
+    capture_video: bool = False  # Whether to record video
 
 
 def seed_everything(seed):
@@ -39,27 +44,6 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
-
-
-def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-
-        #! below are important
-        # env = gym.wrappers.ClipAction(env)
-        # env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        # env = gym.wrappers.NormalizeReward(env)
-        # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        return env
-
-    return thunk
 
 
 class Agent(nn.Module):
@@ -102,7 +86,7 @@ def main():
     batch_size = args.num_envs * args.num_steps
     mini_batch_size = batch_size // 32
     num_iterations = args.total_timesteps // batch_size
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
     seed_everything(args.seed)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -113,7 +97,14 @@ def main():
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    envs = gym.vector.SyncVectorEnv([make_env(args.env_id, i, False, run_name) for i in range(args.num_envs)])
+    # Use the unified environment interface
+    envs = create_vector_env(
+        env_id=args.env_id,
+        num_envs=args.num_envs,
+        capture_video=args.capture_video,
+        run_name=run_name,
+        device=args.device,
+    )
 
     obs, _ = envs.reset(seed=args.seed)
     obs = torch.from_numpy(obs).float().to(device)
