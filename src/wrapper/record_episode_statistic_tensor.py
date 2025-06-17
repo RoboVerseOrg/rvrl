@@ -74,9 +74,7 @@ class RecordEpisodeStatisticsTensor(gym.Wrapper):
         assert isinstance(infos, dict)
 
         self.episode_returns[self.prev_dones] = 0
-        self.episode_returns[torch.logical_not(self.prev_dones)] += rewards.cpu()[
-            torch.logical_not(self.prev_dones)
-        ]  # XXX
+        self.episode_returns[~self.prev_dones] += rewards.cpu()[~self.prev_dones]
 
         self.episode_lengths[self.prev_dones] = 0
         self.episode_lengths[~self.prev_dones] += 1
