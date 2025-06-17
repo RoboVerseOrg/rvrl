@@ -107,7 +107,6 @@ def main():
     )
 
     obs, _ = envs.reset(seed=args.seed)
-    obs = torch.from_numpy(obs).float().to(device)
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.lr, eps=1e-5)
 
@@ -140,15 +139,15 @@ def main():
                 action, log_prob, entropy = agent.get_action(obs)
                 value = agent.get_value(obs)
 
-            next_obs, reward, terminated, truncated, infos = envs.step(action.cpu().numpy())
-            next_done = np.logical_or(terminated, truncated)
+            next_obs, reward, terminated, truncated, infos = envs.step(action)
+            next_done = torch.logical_or(terminated, truncated)
 
             actions[t] = action
             log_probs[t] = log_prob
             values[t] = value.view(-1)
-            rewards[t] = torch.from_numpy(reward).float().to(device).view(-1)
-            obss[t + 1] = torch.from_numpy(next_obs).float().to(device)
-            dones[t + 1] = torch.from_numpy(next_done).float().to(device)
+            rewards[t] = reward.view(-1)
+            obss[t + 1] = next_obs
+            dones[t + 1] = next_done
 
             obs = obss[t + 1]
 

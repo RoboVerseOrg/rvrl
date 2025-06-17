@@ -1,8 +1,8 @@
 """Unified environment factory for creating different types of environments."""
 
-
 import gymnasium as gym
 
+from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
 
 
 ## Used for DMControl
@@ -26,6 +26,7 @@ def make_env(env_id, idx, capture_video, run_name):
 
     return thunk
 
+
 ## Main function to create vectorized environment
 def create_vector_env(
     env_id: str, num_envs: int, capture_video: bool = False, run_name: str = "", device: str = "cuda", **kwargs
@@ -47,4 +48,14 @@ def create_vector_env(
     if env_id.startswith("dm_control/"):
         # Use gymnasium's vector environment
         env_fns = [make_env(env_id, i, capture_video and i == 0, run_name, **kwargs) for i in range(num_envs)]
-        return gym.vector.SyncVectorEnv(env_fns)
+        envs = gym.vector.SyncVectorEnv(env_fns)
+        envs = NumpyToTorch(envs, device)
+        return envs
+
+    elif env_id.startswith("Isaac-"):
+        from .isaaclab_env import IsaacLabEnv
+
+        envs = IsaacLabEnv(env_id, num_envs, seed=kwargs.get("seed", 0))  # TODO: seed
+        return envs
+    else:
+        raise ValueError(f"Unknown environment: {env_id}")

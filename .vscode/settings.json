@@ -18,4 +18,14 @@
 
     // Linting
     "ruff.lint.enable": true,
+
+    // Python extra paths
+    "python.analysis.extraPaths": [
+        /* IssacLab */
+        "${workspaceFolder}/third_party/IsaacLab/source/isaaclab",
+        "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_assets",
+        "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_mimic",
+        "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_rl",
+        "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_tasks",
+    ],
 }
