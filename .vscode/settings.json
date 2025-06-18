@@ -27,5 +27,7 @@
         "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_mimic",
         "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_rl",
         "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_tasks",
+        /* IsaacGymEnvs */
+        "${workspaceFolder}/third_party/IsaacGymEnvs",
     ],
 }

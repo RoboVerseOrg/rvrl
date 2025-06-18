@@ -1,10 +1,12 @@
-from typing import Any
+from __future__ import annotations
+
+from typing import Any, Union
 
 import gymnasium as gym
 import numpy as np
 import torch
 
-Device = str | torch.device
+Device = Union[str, torch.device]
 
 
 def numpy_to_torch(x: np.ndarray, device: Device | None = None) -> torch.Tensor:
