@@ -1,3 +1,10 @@
+from __future__ import annotations
+
+try:
+    import isaacgym
+except ImportError:
+    pass
+
 import math
 import random
 import time
@@ -105,6 +112,9 @@ def main():
         run_name=run_name,
         device=args.device,
     )
+
+    log.info(f"{envs.single_action_space.shape=}")
+    log.info(f"{envs.single_observation_space.shape=}")
 
     obs, _ = envs.reset(seed=args.seed)
     agent = Agent(envs).to(device)

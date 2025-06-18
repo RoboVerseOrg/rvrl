@@ -59,5 +59,11 @@ def create_vector_env(
 
         envs = IsaacLabEnv(env_id, num_envs, seed=kwargs.get("seed", 0))  # TODO: seed
         return envs
+    elif env_id.startswith("isaacgymenv/"):
+        from .isaacgym_env import IsaacGymEnv
+
+        envs = IsaacGymEnv(env_id, num_envs, seed=kwargs.get("seed", 0))
+        envs = RecordEpisodeStatisticsTensor(envs)
+        return envs
     else:
         raise ValueError(f"Unknown environment: {env_id}")

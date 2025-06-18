@@ -8,6 +8,7 @@ import time
 import gymnasium as gym
 import torch
 from gymnasium.vector.vector_env import VectorEnv
+from loguru import logger as log
 
 
 class RecordEpisodeStatisticsTensor(gym.Wrapper):
@@ -86,17 +87,16 @@ class RecordEpisodeStatisticsTensor(gym.Wrapper):
 
         if num_dones:
             if self._stats_key in infos or f"_{self._stats_key}" in infos:
-                raise ValueError(
-                    f"Attempted to add episode stats with key '{self._stats_key}' but this key already exists in info: {list(infos.keys())}"
+                log.error(
+                    f"Attempted to add episode stats with key '{self._stats_key}' but this key already exists in info: {list(infos.keys())}, overwriting..."
                 )
-            else:
-                episode_time_length = torch.round(time.perf_counter() - self.episode_start_times, decimals=6)
-                infos[self._stats_key] = {
-                    "r": torch.where(dones, self.episode_returns, 0.0),
-                    "l": torch.where(dones, self.episode_lengths, 0),
-                    "t": torch.where(dones, episode_time_length, 0.0),
-                }
-                infos[f"_{self._stats_key}"] = dones
+            episode_time_length = torch.round(time.perf_counter() - self.episode_start_times, decimals=6)
+            infos[self._stats_key] = {
+                "r": torch.where(dones, self.episode_returns, 0.0),
+                "l": torch.where(dones, self.episode_lengths, 0),
+                "t": torch.where(dones, episode_time_length, 0.0),
+            }
+            infos[f"_{self._stats_key}"] = dones
 
             self.episode_count += num_dones
 
