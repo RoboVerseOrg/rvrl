@@ -28,7 +28,13 @@ def make_env(env_id, idx, capture_video, run_name):
 
 ## Main function to create vectorized environment
 def create_vector_env(
-    env_id: str, num_envs: int, capture_video: bool = False, run_name: str = "", device: str = "cuda", **kwargs
+    env_id: str,
+    num_envs: int,
+    seed: int,
+    capture_video: bool = False,
+    run_name: str = "",
+    device: str = "cuda",
+    **kwargs,
 ):
     """
     Create a vectorized environment.
@@ -49,15 +55,15 @@ def create_vector_env(
         envs = gym.vector.SyncVectorEnv(env_fns)
         envs = NumpyToTorch(envs, device)
         return envs
-    elif env_id.startswith("Isaac-"):
+    elif env_id.startswith("isaaclab/"):
         from .isaaclab_env import IsaacLabEnv
 
-        envs = IsaacLabEnv(env_id, num_envs, seed=kwargs.get("seed", 0))  # TODO: seed
+        envs = IsaacLabEnv(env_id.replace("isaaclab/", ""), num_envs, seed=seed)
         return envs
     elif env_id.startswith("isaacgymenv/"):
         from .isaacgym_env import IsaacGymEnv
 
-        envs = IsaacGymEnv(env_id, num_envs, seed=kwargs.get("seed", 0))
+        envs = IsaacGymEnv(env_id, num_envs, seed=seed)
         return envs
     else:
         raise ValueError(f"Unknown environment: {env_id}")

@@ -135,6 +135,7 @@ def main():
     envs = create_vector_env(
         env_id=args.env_id,
         num_envs=args.num_envs,
+        seed=args.seed,
         capture_video=args.capture_video,
         run_name=run_name,
         device=args.device,
