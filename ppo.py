@@ -5,14 +5,12 @@ try:
 except ImportError:
     pass
 
-import math
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from statistics import mean
 
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -23,10 +21,40 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-# Import our unified environment interface
 from src.envs import create_vector_env
 
 
+########################################################
+## Standalone utils
+########################################################
+class RollingMeter:
+    def __init__(self, window_size: int):
+        self.window_size = window_size
+        self.deque = deque(maxlen=window_size)
+
+    def update(self, rewards: torch.Tensor):
+        self.deque.extend(rewards.cpu().numpy().tolist())
+
+    @property
+    def mean(self) -> float:
+        return np.mean(self.deque).item()
+
+    @property
+    def std(self) -> float:
+        return np.std(self.deque).item()
+
+
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+########################################################
+## Args
+########################################################
 @dataclass
 class Args:
     env_id: str = "dm_control/cartpole-balance-v0"
@@ -43,16 +71,12 @@ class Args:
     anneal_lr: bool = True
     device: str = "cuda"  # Device for IsaacLab environments
     capture_video: bool = False  # Whether to record video
+    window_size: int = 100
 
 
-def seed_everything(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-
+########################################################
+## Networks
+########################################################
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
@@ -88,6 +112,9 @@ class Agent(nn.Module):
         return self.critic(obs)
 
 
+########################################################
+## Main
+########################################################
 def main():
     args = tyro.cli(Args)
     batch_size = args.num_envs * args.num_steps
@@ -128,6 +155,11 @@ def main():
     advantages = torch.zeros((args.num_steps + 1, args.num_envs), device=device)
     dones = torch.zeros((args.num_steps + 1, args.num_envs), device=device)
 
+    episode_rewards = RollingMeter(args.window_size)
+    episode_lengths = RollingMeter(args.window_size)
+    cur_rewards_sum = torch.zeros(args.num_envs, device=device)
+    cur_episode_length = torch.zeros(args.num_envs, device=device)
+
     obss[0] = obs
     dones[0] = torch.zeros(args.num_envs).to(device)
 
@@ -152,6 +184,15 @@ def main():
             next_obs, reward, terminated, truncated, infos = envs.step(action)
             next_done = torch.logical_or(terminated, truncated)
 
+            cur_rewards_sum += reward
+            cur_episode_length += 1
+            episode_rewards.update(cur_rewards_sum[next_done])
+            episode_lengths.update(cur_episode_length[next_done])
+            if next_done.any():
+                writer.add_scalar("charts/episodic_return", cur_rewards_sum[next_done].mean().item(), global_step)
+            cur_rewards_sum[next_done] = 0
+            cur_episode_length[next_done] = 0
+
             actions[t] = action
             log_probs[t] = log_prob
             values[t] = value.view(-1)
@@ -160,28 +201,6 @@ def main():
             dones[t + 1] = next_done
 
             obs = obss[t + 1]
-
-            ## Option 1: src.wrapper.record_episode_statistic_tensor.RecordEpisodeStatisticsTensor
-            if "episode" in infos:
-                writer.add_scalar("charts/episodic_return_mean", infos["episode"]["r"].mean(), global_step)
-                writer.add_scalar("charts/episodic_return_min", infos["episode"]["r"].min(), global_step)
-                writer.add_scalar("charts/episodic_return_max", infos["episode"]["r"].max(), global_step)
-                writer.add_scalar("charts/episodic_length_mean", infos["episode"]["l"].float().mean(), global_step)
-                print(f"global_step={global_step}, episode_return={infos['episode']['r'].mean()}")
-
-            ## Option 2: gym.wrappers.RecordEpisodeStatistics
-            # if "final_info" in infos:
-            #     episode_returns = []
-            #     episode_lengths = []
-            #     for info in infos["final_info"]:
-            #         if info and "episode" in info:
-            #             episode_returns.append(info["episode"]["r"])
-            #             episode_lengths.append(info["episode"]["l"])
-            #             print(f"global_step={global_step}, episode_return={info['episode']['r']}")
-            #     writer.add_scalar("charts/episodic_return_mean", np.mean(episode_returns), global_step)
-            #     writer.add_scalar("charts/episodic_return_min", np.min(episode_returns), global_step)
-            #     writer.add_scalar("charts/episodic_return_max", np.max(episode_returns), global_step)
-            #     writer.add_scalar("charts/episodic_length_mean", np.mean(episode_lengths), global_step)
 
         values[args.num_steps] = agent.get_value(obss[args.num_steps]).view(-1)
 
@@ -234,6 +253,12 @@ def main():
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+        ## log
+        writer.add_scalar("charts/episodic_return_mean", episode_rewards.mean, global_step)
+        writer.add_scalar("charts/episodic_return_std", episode_rewards.std, global_step)
+        writer.add_scalar("charts/episodic_length_mean", episode_lengths.mean, global_step)
+        writer.add_scalar("charts/episodic_length_std", episode_lengths.std, global_step)
 
         print(f"SPS: {global_step / (time.time() - start_time):.2f}")
 

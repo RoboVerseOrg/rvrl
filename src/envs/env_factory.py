@@ -3,7 +3,6 @@
 import gymnasium as gym
 
 from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
-from src.wrapper.record_episode_statistic_tensor import RecordEpisodeStatisticsTensor
 
 
 ## Used for DMControl
@@ -15,9 +14,8 @@ def make_env(env_id, idx, capture_video, run_name):
         else:
             env = gym.make(env_id)
         env = gym.wrappers.FlattenObservation(env)
-        # env = gym.wrappers.RecordEpisodeStatistics(env)
 
-        #! below are important
+        # TODO: is below necessary?
         # env = gym.wrappers.ClipAction(env)
         # env = gym.wrappers.NormalizeObservation(env)
         # env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
@@ -47,13 +45,10 @@ def create_vector_env(
         Vectorized environment
     """
     if env_id.startswith("dm_control/"):
-        # Use gymnasium's vector environment
         env_fns = [make_env(env_id, i, capture_video and i == 0, run_name, **kwargs) for i in range(num_envs)]
         envs = gym.vector.SyncVectorEnv(env_fns)
         envs = NumpyToTorch(envs, device)
-        envs = RecordEpisodeStatisticsTensor(envs)
         return envs
-
     elif env_id.startswith("Isaac-"):
         from .isaaclab_env import IsaacLabEnv
 
@@ -63,7 +58,6 @@ def create_vector_env(
         from .isaacgym_env import IsaacGymEnv
 
         envs = IsaacGymEnv(env_id, num_envs, seed=kwargs.get("seed", 0))
-        envs = RecordEpisodeStatisticsTensor(envs)
         return envs
     else:
         raise ValueError(f"Unknown environment: {env_id}")
