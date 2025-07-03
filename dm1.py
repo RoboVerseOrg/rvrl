@@ -394,7 +394,7 @@ def main():
             data = buffer.sample(args.batch_size, 50)
 
             ## Dynamic Learning
-            prior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
+            posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
             deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
             embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
 
@@ -406,7 +406,7 @@ def main():
             posterior_stds = []
             deterministics = []
             for t in range(1, args.batch_length):
-                deterministic = recurrent_model(prior, data["action"][:, t - 1], deterministic)
+                deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
                 prior_dist, prior = transition_model(deterministic)
                 posterior_dist, posterior = representation_model(embeded_obs[:, t], deterministic)
 
@@ -417,8 +417,6 @@ def main():
                 posterior_means.append(posterior_dist.mean)
                 posterior_stds.append(posterior_dist.scale)
                 deterministics.append(deterministic)
-
-                prior = posterior
 
             priors = torch.stack(priors, dim=1).to(device)
             prior_means = torch.stack(prior_means, dim=1).to(device)
