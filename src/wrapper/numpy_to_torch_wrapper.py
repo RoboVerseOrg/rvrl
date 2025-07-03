@@ -17,7 +17,7 @@ def numpy_to_torch(x: np.ndarray, device: Device | None = None) -> torch.Tensor:
 
 
 def torch_to_numpy(x: torch.Tensor) -> np.ndarray:
-    return x.cpu().numpy()
+    return x.detach().cpu().numpy()
 
 
 class NumpyToTorch(gym.Wrapper, gym.utils.RecordConstructorArgs):
