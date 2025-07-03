@@ -19,7 +19,7 @@ import torch.nn.functional as F
 import tyro
 from loguru import logger as log
 from torch import Tensor
-from torch.distributions import Distribution, Independent, Normal, kl_divergence
+from torch.distributions import Distribution, Independent, Normal, TanhTransform, TransformedDistribution, kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
 pass
@@ -159,6 +159,27 @@ class ReplayBuffer(object):
         return sample
 
 
+def compute_lambda_values(
+    rewards: Tensor, values: Tensor, continues: Tensor, horizon_length: int, device: torch.device, gae_lambda: float
+) -> Tensor:
+    """
+    rewards : (batch_size, time_step)
+    values : (batch_size, time_step)
+    """
+    rewards = rewards[:, :-1]
+    continues = continues[:, :-1]
+    next_values = values[:, 1:]
+    last = next_values[:, -1]
+    inputs = rewards + continues * next_values * (1 - gae_lambda)
+
+    outputs = []
+    for index in reversed(range(horizon_length - 1)):
+        last = inputs[:, index] + continues[:, index] * gae_lambda * last
+        outputs.append(last)
+    returns = torch.stack(list(reversed(outputs)), dim=1).to(device)
+    return returns
+
+
 ########################################################
 ## Args
 ########################################################
@@ -178,6 +199,8 @@ class Args:
     stochastic_size: int = 30  # XXX: what is this?
     deterministic_size: int = 200  # XXX: what is this?
     embedded_obs_size: int = 1024
+    horizon: int = 15
+    gae_lambda: float = 0.95
 
 
 args = tyro.cli(Args)
@@ -314,16 +337,37 @@ class Actor(nn.Module):
         self.actor = nn.Sequential(
             nn.Linear(args.deterministic_size + args.stochastic_size, 400),
             nn.ELU(),
-            nn.Linear(400, envs.single_action_space.shape[0]),
+            nn.Linear(400, envs.single_action_space.shape[0] * 2),
         )
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
-        x = torch.cat([posterior, deterministic], dim=1)
-        return self.actor(x)
+        x = torch.cat([posterior, deterministic], dim=-1)
+        mean, std = self.actor(x).chunk(2, dim=-1)
+        mean = 5 * F.tanh(mean / 5)  # XXX: what is this?
+        std = F.softplus(std + 5) + 1e-4  # XXX: why add 5? why add 1e-4?
+        action_dist = TransformedDistribution(Normal(mean, std), TanhTransform())  # XXX: why use TanhTransform?
+        action_dist = Independent(action_dist, 1)
+        action = action_dist.rsample()  #! important to use rsample()
+        return action
 
 
 class Critic(nn.Module):
-    pass
+    def __init__(self):
+        super().__init__()
+        self.critic = nn.Sequential(
+            nn.Linear(args.stochastic_size + args.deterministic_size, 400),
+            nn.ELU(),
+            nn.Linear(400, 400),
+            nn.ELU(),
+            nn.Linear(400, 1),
+        )
+
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
+        x = torch.cat([posterior, deterministic], dim=-1)
+        mean = self.critic(x)
+        std = 1  # XXX: why std is 1?
+        dist = Independent(Normal(mean, std), 1)
+        return dist
 
 
 ########################################################
@@ -366,6 +410,8 @@ def main():
         reward_predictor.parameters(),
     )
     model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
+    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
 
     ## rollout before training
     for _ in range(1):
@@ -391,6 +437,7 @@ def main():
     ## training loop
     for iteration in range(args.num_iterations):
         for sample_index in range(100):
+            log.info(f"Training iteration {iteration}, sample {sample_index}")
             data = buffer.sample(args.batch_size, 50)
 
             ## Dynamic Learning
@@ -446,6 +493,45 @@ def main():
             model_loss.backward()
             nn.utils.clip_grad_norm_(model_params, 100)
             model_optimizer.step()
+
+            ## Behavior learning
+
+            # reuse the `posteriors` and `deterministics` from model learning, important to detach them!
+            state = posteriors.detach().view(-1, args.stochastic_size)
+            deterministic = deterministics.detach().view(-1, args.deterministic_size)
+
+            states = []
+            deterministics = []
+            for t in range(args.horizon):
+                action = actor(state, deterministic)  # XXX: why don't use prior? previously used prior
+                deterministic = recurrent_model(state, action, deterministic)
+                _, state = transition_model(deterministic)
+                states.append(state)
+                deterministics.append(deterministic)
+
+            states = torch.stack(states, dim=1)
+            deterministics = torch.stack(deterministics, dim=1)
+            print(f"{states.shape=}, {deterministics.shape=}")
+            predicted_rewards = reward_predictor(states, deterministics).mean
+            print(f"{predicted_rewards.shape=}")
+            values = critic(states, deterministics).mean
+            continues = torch.ones_like(values) * 0.99
+            lambda_values = compute_lambda_values(
+                predicted_rewards, values, continues, args.horizon, device, args.gae_lambda
+            )
+
+            actor_loss = -lambda_values.mean()  # direct policy gradient
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(actor.parameters(), 100)
+            actor_optimizer.step()
+
+            value_dist = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
+            value_loss = -value_dist.log_prob(lambda_values.detach()).mean()
+            critic_optimizer.zero_grad()
+            value_loss.backward()
+            nn.utils.clip_grad_norm_(critic.parameters(), 100)
+            critic_optimizer.step()
 
 
 if __name__ == "__main__":
