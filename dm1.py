@@ -89,6 +89,10 @@ class DMCWrapper:
     def metadata(self):
         return {}
 
+    @property
+    def episode_length(self) -> int:
+        return int(self.env._step_limit / self.decimation)
+
 
 ########################################################
 ## Standalone utils
