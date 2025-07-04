@@ -373,48 +373,49 @@ class Critic(nn.Module):
 ########################################################
 ## Main
 ########################################################
-def main():
-    ## setup
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
-    seed_everything(args.seed)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{timestamp}"
 
-    envs = gym.vector.SyncVectorEnv([
-        lambda: DMCWrapper(args.env_id.removeprefix("dm_control/"), args.seed) for _ in range(args.num_envs)
-    ])
-    envs = NumpyToTorch(envs, device=device)
-    writer = SummaryWriter(f"logdir/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
-    buffer = ReplayBuffer(envs.single_observation_space.shape, envs.single_action_space.shape[0], device)
+## setup
+device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
+seed_everything(args.seed)
+_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
 
-    ## networks
-    encoder = Encoder().to(device)
-    decoder = Decoder().to(device)
-    recurrent_model = RecurrentModel(envs).to(device)
-    transition_model = TransitionModel().to(device)
-    representation_model = RepresentationModel().to(device)
-    reward_predictor = RewardPredictor().to(device)
-    actor = Actor(envs).to(device)
-    critic = Critic().to(device)
-    model_params = chain(
-        encoder.parameters(),
-        decoder.parameters(),
-        recurrent_model.parameters(),
-        transition_model.parameters(),
-        representation_model.parameters(),
-        reward_predictor.parameters(),
-    )
-    model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr)
-    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-    critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+envs = gym.vector.SyncVectorEnv([
+    lambda: DMCWrapper(args.env_id.removeprefix("dm_control/"), args.seed) for _ in range(args.num_envs)
+])
+envs = NumpyToTorch(envs, device=device)
+writer = SummaryWriter(f"logdir/{run_name}")
+writer.add_text(
+    "hyperparameters",
+    "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+)
+buffer = ReplayBuffer(envs.single_observation_space.shape, envs.single_action_space.shape[0], device)
 
-    ## rollout before training
-    for _ in range(1):
+## networks
+encoder = Encoder().to(device)
+decoder = Decoder().to(device)
+recurrent_model = RecurrentModel(envs).to(device)
+transition_model = TransitionModel().to(device)
+representation_model = RepresentationModel().to(device)
+reward_predictor = RewardPredictor().to(device)
+actor = Actor(envs).to(device)
+critic = Critic().to(device)
+model_params = chain(
+    encoder.parameters(),
+    decoder.parameters(),
+    recurrent_model.parameters(),
+    transition_model.parameters(),
+    representation_model.parameters(),
+    reward_predictor.parameters(),
+)
+model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr)
+actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
+critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+
+
+def rollout(num_episodes: int):
+    for _ in range(num_episodes):
         posterior = torch.zeros(1, args.stochastic_size, device=device)
         deterministic = torch.zeros(1, args.deterministic_size, device=device)
         action = actor(posterior, deterministic)
@@ -432,6 +433,102 @@ def main():
             obs = next_obs
             if done.all():
                 break
+
+
+def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
+    deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
+    embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
+
+    priors = []
+    prior_means = []
+    prior_stds = []
+    posteriors = []
+    posterior_means = []
+    posterior_stds = []
+    deterministics = []
+    for t in range(1, args.batch_length):
+        deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
+        prior_dist, prior = transition_model(deterministic)
+        posterior_dist, posterior = representation_model(embeded_obs[:, t], deterministic)
+
+        priors.append(prior)
+        prior_means.append(prior_dist.mean)
+        prior_stds.append(prior_dist.scale)
+        posteriors.append(posterior)
+        posterior_means.append(posterior_dist.mean)
+        posterior_stds.append(posterior_dist.scale)
+        deterministics.append(deterministic)
+
+    priors = torch.stack(priors, dim=1).to(device)
+    prior_means = torch.stack(prior_means, dim=1).to(device)
+    prior_stds = torch.stack(prior_stds, dim=1).to(device)
+    posteriors = torch.stack(posteriors, dim=1).to(device)
+    posterior_means = torch.stack(posterior_means, dim=1).to(device)
+    posterior_stds = torch.stack(posterior_stds, dim=1).to(device)
+    deterministics = torch.stack(deterministics, dim=1).to(device)
+
+    reconstructed_obs_dist = decoder(posteriors, deterministics)
+    reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
+    reward_dist = reward_predictor(posteriors, deterministics)
+    reward_loss = -reward_dist.log_prob(data["reward"][:, 1:]).mean()
+
+    ## XXX: why recreate the distribution? what does Independent do?
+    prior_dist = Independent(Normal(prior_means, prior_stds), 1)
+    posterior_dist = Independent(Normal(posterior_means, posterior_stds), 1)
+    kl_loss = kl_divergence(posterior_dist, prior_dist).mean()
+
+    ## TODO: add coefficients for loss terms
+    model_loss = reconstructed_obs_loss + reward_loss + kl_loss
+
+    model_optimizer.zero_grad()
+    model_loss.backward()
+    nn.utils.clip_grad_norm_(model_params, 100)
+    model_optimizer.step()
+
+    return posteriors, deterministics
+
+
+def behavior_learning(posteriors: Tensor, deterministics: Tensor):
+    ## reuse the `posteriors` and `deterministics` from model learning, important to detach them!
+    state = posteriors.detach().view(-1, args.stochastic_size)
+    deterministic = deterministics.detach().view(-1, args.deterministic_size)
+
+    states = []
+    deterministics = []
+    for t in range(args.horizon):
+        action = actor(state, deterministic)  # XXX: why don't use prior? previously used prior
+        deterministic = recurrent_model(state, action, deterministic)
+        _, state = transition_model(deterministic)
+        states.append(state)
+        deterministics.append(deterministic)
+
+    states = torch.stack(states, dim=1)
+    deterministics = torch.stack(deterministics, dim=1)
+    print(f"{states.shape=}, {deterministics.shape=}")
+    predicted_rewards = reward_predictor(states, deterministics).mean
+    print(f"{predicted_rewards.shape=}")
+    values = critic(states, deterministics).mean
+    continues = torch.ones_like(values) * 0.99
+    lambda_values = compute_lambda_values(predicted_rewards, values, continues, args.horizon, device, args.gae_lambda)
+
+    actor_loss = -lambda_values.mean()  # direct policy gradient
+    actor_optimizer.zero_grad()
+    actor_loss.backward()
+    nn.utils.clip_grad_norm_(actor.parameters(), 100)
+    actor_optimizer.step()
+
+    value_dist = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
+    value_loss = -value_dist.log_prob(lambda_values.detach()).mean()
+    critic_optimizer.zero_grad()
+    value_loss.backward()
+    nn.utils.clip_grad_norm_(critic.parameters(), 100)
+    critic_optimizer.step()
+
+
+def main():
+    ## rollout before training
+    rollout(5)
     log.info(f"Pre-collected buffer size: {len(buffer)}")
 
     ## training loop
@@ -439,99 +536,10 @@ def main():
         for sample_index in range(100):
             log.info(f"Training iteration {iteration}, sample {sample_index}")
             data = buffer.sample(args.batch_size, 50)
+            posteriors, deterministics = dynamic_learning(data)
+            behavior_learning(posteriors, deterministics)
 
-            ## Dynamic Learning
-            posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
-            deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
-            embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
-
-            priors = []
-            prior_means = []
-            prior_stds = []
-            posteriors = []
-            posterior_means = []
-            posterior_stds = []
-            deterministics = []
-            for t in range(1, args.batch_length):
-                deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
-                prior_dist, prior = transition_model(deterministic)
-                posterior_dist, posterior = representation_model(embeded_obs[:, t], deterministic)
-
-                priors.append(prior)
-                prior_means.append(prior_dist.mean)
-                prior_stds.append(prior_dist.scale)
-                posteriors.append(posterior)
-                posterior_means.append(posterior_dist.mean)
-                posterior_stds.append(posterior_dist.scale)
-                deterministics.append(deterministic)
-
-            priors = torch.stack(priors, dim=1).to(device)
-            prior_means = torch.stack(prior_means, dim=1).to(device)
-            prior_stds = torch.stack(prior_stds, dim=1).to(device)
-            posteriors = torch.stack(posteriors, dim=1).to(device)
-            posterior_means = torch.stack(posterior_means, dim=1).to(device)
-            posterior_stds = torch.stack(posterior_stds, dim=1).to(device)
-            deterministics = torch.stack(deterministics, dim=1).to(device)
-
-            print(f"{posteriors.shape=}")
-            print(f"{deterministics.shape=}")
-            reconstructed_obs_dist = decoder(posteriors, deterministics)
-            print(f"{reconstructed_obs_dist.batch_shape=}, {reconstructed_obs_dist.event_shape=}")
-            reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
-            reward_dist = reward_predictor(posteriors, deterministics)
-            reward_loss = -reward_dist.log_prob(data["reward"][:, 1:]).mean()
-
-            ## XXX: why recreate the distribution? what does Independent do?
-            prior_dist = Independent(Normal(prior_means, prior_stds), 1)
-            posterior_dist = Independent(Normal(posterior_means, posterior_stds), 1)
-            kl_loss = kl_divergence(posterior_dist, prior_dist).mean()
-
-            ## TODO: add coefficients for loss terms
-            model_loss = reconstructed_obs_loss + reward_loss + kl_loss
-
-            model_optimizer.zero_grad()
-            model_loss.backward()
-            nn.utils.clip_grad_norm_(model_params, 100)
-            model_optimizer.step()
-
-            ## Behavior learning
-
-            # reuse the `posteriors` and `deterministics` from model learning, important to detach them!
-            state = posteriors.detach().view(-1, args.stochastic_size)
-            deterministic = deterministics.detach().view(-1, args.deterministic_size)
-
-            states = []
-            deterministics = []
-            for t in range(args.horizon):
-                action = actor(state, deterministic)  # XXX: why don't use prior? previously used prior
-                deterministic = recurrent_model(state, action, deterministic)
-                _, state = transition_model(deterministic)
-                states.append(state)
-                deterministics.append(deterministic)
-
-            states = torch.stack(states, dim=1)
-            deterministics = torch.stack(deterministics, dim=1)
-            print(f"{states.shape=}, {deterministics.shape=}")
-            predicted_rewards = reward_predictor(states, deterministics).mean
-            print(f"{predicted_rewards.shape=}")
-            values = critic(states, deterministics).mean
-            continues = torch.ones_like(values) * 0.99
-            lambda_values = compute_lambda_values(
-                predicted_rewards, values, continues, args.horizon, device, args.gae_lambda
-            )
-
-            actor_loss = -lambda_values.mean()  # direct policy gradient
-            actor_optimizer.zero_grad()
-            actor_loss.backward()
-            nn.utils.clip_grad_norm_(actor.parameters(), 100)
-            actor_optimizer.step()
-
-            value_dist = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
-            value_loss = -value_dist.log_prob(lambda_values.detach()).mean()
-            critic_optimizer.zero_grad()
-            value_loss.backward()
-            nn.utils.clip_grad_norm_(critic.parameters(), 100)
-            critic_optimizer.step()
+        rollout(1)
 
 
 if __name__ == "__main__":
