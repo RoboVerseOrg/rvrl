@@ -5,11 +5,15 @@ try:
 except ImportError:
     pass
 
+import os
 import random
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
 from typing import Sequence
+
+os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
 
 import gymnasium as gym
 import numpy as np
@@ -18,48 +22,54 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tyro
 from loguru import logger as log
+from rich.logging import RichHandler
 from torch import Tensor
 from torch.distributions import Distribution, Independent, Normal, TanhTransform, TransformedDistribution, kl_divergence
 from torch.utils.tensorboard import SummaryWriter
 
-pass
+log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 
 
 ########################################################
 ## Experimental
 ########################################################
 from dm_control import suite
-from dm_env import specs
 from gymnasium import spaces
 
 from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
 
 
 class DMCWrapper:
-    def __init__(self, env_id: str, seed: int, width: int = 64, height: int = 64):
+    def __init__(self, env_id: str, seed: int, width: int = 64, height: int = 64, decimation: int = 1):
         domain_name = env_id.split("-")[0]
         task_name = env_id.split("-")[1]
         self.env = suite.load(domain_name, task_name)
         self.seed = seed
         self.width = width
         self.height = height
+        self.decimation = decimation
         action_spec = self.env.action_spec()
         self._action_space = spaces.Box(
             low=-1, high=1, shape=action_spec.shape, dtype=np.float32
         )  # XXX: may only work for walker
 
-    def reset(self):
+    def reset(self) -> tuple[np.ndarray, dict]:
         self.env.reset()
         obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
         obs = np.transpose(obs, (2, 0, 1)).copy()  # (H, W, 3) -> (3, H, W)
         return obs, {}
 
-    def step(self, action: np.ndarray):
-        data = self.env.step(action)
+    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
+        reward = 0
+        for _ in range(self.decimation):
+            data = self.env.step(action)
+            reward += data.reward
+            done = data.last()
+            if done:
+                break
         obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
         obs = np.transpose(obs, (2, 0, 1)).copy()  # (H, W, 3) -> (3, H, W)
-        done = data.last()
-        return obs, data.reward, done, done, {}
+        return obs, reward, done, done, {}
 
     def render(self):
         raise NotImplementedError
@@ -253,7 +263,6 @@ class Decoder(nn.Module):
         x = torch.cat([posterior, deterministic], dim=1)
         mean = self.decoder(x)
         mean = mean.unflatten(0, input_shape[:2])
-        print(f"{mean.shape=}")
         std = 1  # XXX: why std is 1?
         dist = Independent(Normal(mean, std), 3)  # 3 is number of dimensions for observation space, shape is (3, H, W)
         return dist
@@ -382,7 +391,7 @@ _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
 
 envs = gym.vector.SyncVectorEnv([
-    lambda: DMCWrapper(args.env_id.removeprefix("dm_control/"), args.seed) for _ in range(args.num_envs)
+    lambda: DMCWrapper(args.env_id.removeprefix("dm_control/"), args.seed, decimation=2) for _ in range(args.num_envs)
 ])
 envs = NumpyToTorch(envs, device=device)
 writer = SummaryWriter(f"logdir/{run_name}")
@@ -414,15 +423,13 @@ actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
 
 
-def rollout(num_episodes: int):
-    for _ in range(num_episodes):
+def rollout(envs, num_episodes: int):
+    for epi in range(num_episodes):
         posterior = torch.zeros(1, args.stochastic_size, device=device)
         deterministic = torch.zeros(1, args.deterministic_size, device=device)
-        action = actor(posterior, deterministic)
+        action = torch.zeros(1, envs.single_action_space.shape[0], device=device)
         obs, _ = envs.reset()
-        print(f"{obs.shape=}")
-        for _ in range(100):  # for debug
-            # while True:  # for real
+        while True:
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
             _, prior = representation_model(embeded_obs.view(1, -1), deterministic)
@@ -489,10 +496,10 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     return posteriors, deterministics
 
 
-def behavior_learning(posteriors: Tensor, deterministics: Tensor):
+def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     ## reuse the `posteriors` and `deterministics` from model learning, important to detach them!
-    state = posteriors.detach().view(-1, args.stochastic_size)
-    deterministic = deterministics.detach().view(-1, args.deterministic_size)
+    state = posteriors_.detach().view(-1, args.stochastic_size)
+    deterministic = deterministics_.detach().view(-1, args.deterministic_size)
 
     states = []
     deterministics = []
@@ -505,9 +512,7 @@ def behavior_learning(posteriors: Tensor, deterministics: Tensor):
 
     states = torch.stack(states, dim=1)
     deterministics = torch.stack(deterministics, dim=1)
-    print(f"{states.shape=}, {deterministics.shape=}")
     predicted_rewards = reward_predictor(states, deterministics).mean
-    print(f"{predicted_rewards.shape=}")
     values = critic(states, deterministics).mean
     continues = torch.ones_like(values) * 0.99
     lambda_values = compute_lambda_values(predicted_rewards, values, continues, args.horizon, device, args.gae_lambda)
@@ -528,18 +533,26 @@ def behavior_learning(posteriors: Tensor, deterministics: Tensor):
 
 def main():
     ## rollout before training
-    rollout(5)
+    tic = time.time()
+    rollout(envs, 5)
+    toc = time.time()
+    log.info(f"Time taken for pre-rollout: {toc - tic:.2f} seconds")
     log.info(f"Pre-collected buffer size: {len(buffer)}")
 
     ## training loop
     for iteration in range(args.num_iterations):
+        tic = time.time()
         for sample_index in range(100):
-            log.info(f"Training iteration {iteration}, sample {sample_index}")
             data = buffer.sample(args.batch_size, 50)
             posteriors, deterministics = dynamic_learning(data)
             behavior_learning(posteriors, deterministics)
+        toc = time.time()
+        log.info(f"Time taken for training iteration {iteration}: {toc - tic:.2f} seconds")
 
-        rollout(1)
+        tic = time.time()
+        rollout(envs, 1)
+        toc = time.time()
+        log.info(f"Time taken for rollout: {toc - tic:.2f} seconds")
 
 
 if __name__ == "__main__":
