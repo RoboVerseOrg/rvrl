@@ -56,7 +56,7 @@ class DMCWrapper:
     def reset(self) -> tuple[np.ndarray, dict]:
         self.env.reset()
         obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy()  # (H, W, 3) -> (3, H, W)
+        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
@@ -68,7 +68,7 @@ class DMCWrapper:
             if done:
                 break
         obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy()  # (H, W, 3) -> (3, H, W)
+        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
         return obs, reward, done, done, {}
 
     def render(self):
@@ -79,7 +79,7 @@ class DMCWrapper:
 
     @property
     def observation_space(self):
-        return spaces.Box(low=0, high=255, shape=(3, self.width, self.height), dtype=np.uint8)
+        return spaces.Box(low=-0.5, high=0.5, shape=(3, self.width, self.height), dtype=np.float32)
 
     @property
     def action_space(self):
@@ -444,6 +444,7 @@ critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
 cnt_episode = 0
 
 
+@torch.inference_mode()
 def rollout(envs, num_episodes: int):
     global cnt_episode
     for epi in range(num_episodes):
@@ -456,7 +457,7 @@ def rollout(envs, num_episodes: int):
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
             _, posterior = representation_model(embeded_obs.view(1, -1), deterministic)
-            action = actor(posterior, deterministic)
+            action = actor(posterior, deterministic).detach()
             next_obs, reward, terminated, truncated, info = envs.step(action)
             reward_sum += reward
             done = torch.logical_or(terminated, truncated)
