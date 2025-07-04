@@ -223,6 +223,15 @@ args = tyro.cli(Args)
 ########################################################
 ## Networks
 ########################################################
+def initialize_weights(m: nn.Module):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.kaiming_uniform_(m.weight.data, nonlinearity="relu")
+        nn.init.constant_(m.bias.data, 0)
+    elif isinstance(m, nn.Linear):
+        nn.init.kaiming_uniform_(m.weight.data)
+        nn.init.constant_(m.bias.data, 0)
+
+
 class Encoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -236,6 +245,7 @@ class Encoder(nn.Module):
             nn.Conv2d(128, 256, kernel_size=4, stride=2),
             nn.ReLU(),
         )
+        self.encoder.apply(initialize_weights)
 
     def forward(self, obs: Tensor) -> Tensor:
         B = obs.shape[0]
@@ -257,6 +267,7 @@ class Decoder(nn.Module):
             nn.ReLU(),
             nn.ConvTranspose2d(32, 3, kernel_size=6, stride=2),
         )
+        self.decoder.apply(initialize_weights)
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         # posterior: (batch_size, batch_length-1, stochastic_size)
@@ -279,8 +290,8 @@ class RecurrentModel(nn.Module):
         self.act = nn.ELU()
         self.recurrent = nn.GRUCell(200, args.deterministic_size)
 
-    def forward(self, embedded_obs: Tensor, action: Tensor, deterministic: Tensor) -> Tensor:
-        x = torch.cat([embedded_obs, action], dim=1)
+    def forward(self, state: Tensor, action: Tensor, deterministic: Tensor) -> Tensor:
+        x = torch.cat([state, action], dim=1)
         x = self.act(self.linear(x))
         x = self.recurrent(x, deterministic)
         return x
@@ -294,6 +305,7 @@ class TransitionModel(nn.Module):
             nn.ELU(),
             nn.Linear(200, args.stochastic_size * 2),
         )
+        self.net.apply(initialize_weights)
 
     def forward(self, deterministic: Tensor) -> tuple[Distribution, Tensor]:
         mean, std = self.net(deterministic).chunk(2, dim=1)
@@ -311,6 +323,7 @@ class RepresentationModel(nn.Module):
             nn.ELU(),
             nn.Linear(200, args.stochastic_size * 2),
         )
+        self.net.apply(initialize_weights)
 
     def forward(self, embedded_obs: Tensor, deterministic: Tensor) -> tuple[Distribution, Tensor]:
         x = torch.cat([embedded_obs, deterministic], dim=1)
@@ -329,6 +342,7 @@ class RewardPredictor(nn.Module):
             nn.ELU(),
             nn.Linear(200, 1),
         )
+        self.net.apply(initialize_weights)
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         # posterior: (batch_size, batch_length-1, stochastic_size)
@@ -352,6 +366,7 @@ class Actor(nn.Module):
             nn.ELU(),
             nn.Linear(400, envs.single_action_space.shape[0] * 2),
         )
+        self.actor.apply(initialize_weights)
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         x = torch.cat([posterior, deterministic], dim=-1)
@@ -374,6 +389,7 @@ class Critic(nn.Module):
             nn.ELU(),
             nn.Linear(400, 1),
         )
+        self.critic.apply(initialize_weights)
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         x = torch.cat([posterior, deterministic], dim=-1)
@@ -425,25 +441,32 @@ model_params = chain(
 model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr)
 actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+cnt_episode = 0
 
 
 def rollout(envs, num_episodes: int):
+    global cnt_episode
     for epi in range(num_episodes):
         posterior = torch.zeros(1, args.stochastic_size, device=device)
         deterministic = torch.zeros(1, args.deterministic_size, device=device)
         action = torch.zeros(1, envs.single_action_space.shape[0], device=device)
         obs, _ = envs.reset()
+        reward_sum = torch.zeros(envs.num_envs, device=device)
         while True:
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
-            _, prior = representation_model(embeded_obs.view(1, -1), deterministic)
-            action = actor(prior, deterministic)
+            _, posterior = representation_model(embeded_obs.view(1, -1), deterministic)
+            action = actor(posterior, deterministic)
             next_obs, reward, terminated, truncated, info = envs.step(action)
+            reward_sum += reward
             done = torch.logical_or(terminated, truncated)
             buffer.add(obs, action, reward, next_obs, done)
             obs = next_obs
             if done.all():
                 break
+        cnt_episode += 1
+        print(f"Episode {cnt_episode}, Return: {reward_sum.mean().item()}")
+        writer.add_scalar("charts/episodic_return", reward_sum.mean().item(), cnt_episode)
 
 
 def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
@@ -488,6 +511,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     prior_dist = Independent(Normal(prior_means, prior_stds), 1)
     posterior_dist = Independent(Normal(posterior_means, posterior_stds), 1)
     kl_loss = kl_divergence(posterior_dist, prior_dist).mean()
+    kl_loss = torch.max(kl_loss, torch.tensor(3.0, device=device))
 
     ## TODO: add coefficients for loss terms
     model_loss = reconstructed_obs_loss + reward_loss + kl_loss
