@@ -14,6 +14,7 @@ from itertools import chain
 from typing import Sequence
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic run
 
 import gymnasium as gym
 import numpy as np
@@ -43,8 +44,7 @@ class DMCWrapper:
     def __init__(self, env_id: str, seed: int, width: int = 64, height: int = 64, decimation: int = 1):
         domain_name = env_id.split("-")[0]
         task_name = env_id.split("-")[1]
-        self.env = suite.load(domain_name, task_name)
-        self.seed = seed
+        self.env = suite.load(domain_name, task_name, task_kwargs={"random": seed})
         self.width = width
         self.height = height
         self.decimation = decimation
@@ -103,6 +103,13 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+
+def enable_deterministic_run():
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
 
 
 class ReplayBuffer(object):
@@ -407,6 +414,7 @@ class Critic(nn.Module):
 device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
 seed_everything(args.seed)
+enable_deterministic_run()
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
 
