@@ -26,7 +26,7 @@ from loguru import logger as log
 from rich.logging import RichHandler
 from torch import Tensor
 from torch.distributions import Distribution, Independent, Normal, TanhTransform, TransformedDistribution, kl_divergence
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 
@@ -184,19 +184,40 @@ def compute_lambda_values(
     rewards: Tensor, values: Tensor, continues: Tensor, horizon_length: int, device: torch.device, gae_lambda: float
 ) -> Tensor:
     """
-    rewards : (batch_size, time_step)
-    values : (batch_size, time_step)
+    Compute lambda returns (λ-returns) for Generalized Advantage Estimation (GAE).
+
+    The lambda return is computed recursively as:
+    R_t^λ = r_t + γ * [(1 - λ) * V(s_{t+1}) + λ * R_{t+1}^λ]
+
+    Args:
+        rewards: (batch_size, time_step) - rewards at each timestep (r_t)
+        values: (batch_size, time_step) - value estimates at each timestep (V(s_t))
+        horizon_length: int - length of the planning horizon
+        device: torch.device - device to compute on
+        gae_lambda: float - lambda parameter for GAE (λ, typically 0.95)
+
+    Returns:
+        Tensor: (batch_size, horizon_length-1) - lambda returns (R_t^λ)
     """
+    # Remove last timestep since we need t+1 values
     rewards = rewards[:, :-1]
     continues = continues[:, :-1]
     next_values = values[:, 1:]
+
+    # Initialize with the last value estimate
     last = next_values[:, -1]
+
+    # Compute the base term: r_t + γ * (1 - λ) * V(s_{t+1})
     inputs = rewards + continues * next_values * (1 - gae_lambda)
 
+    # Compute lambda returns backward in time
     outputs = []
     for index in reversed(range(horizon_length - 1)):
+        # R_t^λ = [r_t + γ * (1 - λ) * V(s_{t+1})] + γ * λ * R_{t+1}^λ
         last = inputs[:, index] + continues[:, index] * gae_lambda * last
         outputs.append(last)
+
+    # Reverse to get chronological order and move to device
     returns = torch.stack(list(reversed(outputs)), dim=1).to(device)
     return returns
 
