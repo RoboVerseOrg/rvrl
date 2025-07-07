@@ -238,8 +238,8 @@ class Args:
     num_iterations: int = 1000
     batch_size: int = 50
     batch_length: int = 50
-    stochastic_size: int = 30  # XXX: what is this?
-    deterministic_size: int = 200  # XXX: what is this?
+    stochastic_size: int = 30
+    deterministic_size: int = 200
     embedded_obs_size: int = 1024
     horizon: int = 15
     gae_lambda: float = 0.95
@@ -601,7 +601,7 @@ def main():
     for iteration in range(args.num_iterations):
         tic = time.time()
         for sample_index in range(100):
-            data = buffer.sample(args.batch_size, 50)
+            data = buffer.sample(args.batch_size, args.batch_length)
             posteriors, deterministics = dynamic_learning(data)
             behavior_learning(posteriors, deterministics)
         toc = time.time()
