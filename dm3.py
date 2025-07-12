@@ -364,13 +364,14 @@ class RewardPredictor(nn.Module):
             nn.Tanh(),
             nn.Linear(400, 400),
             nn.Tanh(),
-            nn.Linear(400, 2),
+            nn.Linear(400, 1),
         )
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         x = torch.cat([posterior, deterministic], dim=-1)
-        mean, log_std = self.net(x).chunk(2, dim=-1)
-        dist = Independent(Normal(mean, torch.exp(log_std)), 1)
+        mean = self.net(x)
+        std = 1.0
+        dist = Independent(Normal(mean, std), 1)
         return dist
 
 
@@ -386,13 +387,14 @@ class Actor(nn.Module):
         )
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> tuple[Distribution, Tensor]:
-        log_std_min, log_std_max = -5, 2
+        std_min, std_max = 0.1, 1
         x = torch.cat([posterior, deterministic], dim=-1)
-        mean, log_std = self.actor(x).chunk(2, dim=-1)
-        log_std = log_std_min + 0.5 * (log_std_max - log_std_min) * (F.tanh(log_std) + 1)
-        std = torch.exp(log_std)
+        mean, std = self.actor(x).chunk(2, dim=-1)
+        mean = 5 * F.tanh(mean / 5)
+        std = std_min + (std_max - std_min) * F.sigmoid(std + 2.0)
 
-        action_dist = TransformedDistribution(Normal(mean, std), TanhTransform())  # XXX: assume action is in [-1, 1]
+        action_dist = TransformedDistribution(Normal(mean, std), TanhTransform())
+        action_dist = Independent(action_dist, 1)
         action = action_dist.rsample()
         return action_dist, action
 
@@ -405,13 +407,14 @@ class Critic(nn.Module):
             nn.Tanh(),
             nn.Linear(400, 400),
             nn.Tanh(),
-            nn.Linear(400, 2),
+            nn.Linear(400, 1),
         )
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         x = torch.cat([posterior, deterministic], dim=-1)
-        mean, log_std = self.critic(x).chunk(2, dim=-1)
-        dist = Independent(Normal(mean, torch.exp(log_std)), 1)
+        mean = self.critic(x)
+        std = 1.0
+        dist = Independent(Normal(mean, std), 1)
         return dist
 
 
@@ -567,8 +570,7 @@ def behavior_learning(posteriers_: Tensor, deterministics_: Tensor):
     # TODO: do advantage normalization
     advantages = lambda_values - values[:, :-1]
 
-    # actor-critic policy gradient
-    actor_loss = -(advantages.detach() * logprobs[:, 1:]).mean()  # + 0.0003 * entropies.mean()
+    actor_loss = -advantages.mean()  # + 0.0003 * entropies.mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     nn.utils.clip_grad_norm_(actor.parameters(), 100)
@@ -578,14 +580,17 @@ def behavior_learning(posteriers_: Tensor, deterministics_: Tensor):
     value_loss = -value_dist.log_prob(lambda_values.detach()).mean()
     critic_optimizer.zero_grad()
     value_loss.backward()
+    nn.utils.clip_grad_norm_(critic.parameters(), 100)
+    critic_optimizer.step()
 
 
 def main():
     rollout(5)
     for i in range(args.num_iterations):
-        data = buffer.sample(args.batch_size, args.batch_length)
-        posteriors, deterministics = world_model_learning(data)
-        behavior_learning(posteriors, deterministics)
+        for _ in range(100):
+            data = buffer.sample(args.batch_size, args.batch_length)
+            posteriors, deterministics = world_model_learning(data)
+            behavior_learning(posteriors, deterministics)
         rollout(1)
 
 
