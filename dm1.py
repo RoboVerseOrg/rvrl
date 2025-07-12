@@ -575,7 +575,8 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     continues = torch.ones_like(values) * 0.99
     lambda_values = compute_lambda_values(predicted_rewards, values, continues, args.horizon, device, args.gae_lambda)
 
-    actor_loss = -lambda_values.mean()  # direct policy gradient
+    # directly compute the gradient since the "dreamed environment" is differentiable
+    actor_loss = -lambda_values.mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     nn.utils.clip_grad_norm_(actor.parameters(), 100)
