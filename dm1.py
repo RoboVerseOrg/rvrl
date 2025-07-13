@@ -133,22 +133,17 @@ class ReplayBuffer(object):
     def __len__(self):
         return self.capacity if self.full else self.buffer_index
 
-    def add(
-        self,
-        observation: Tensor,
-        action: Tensor,
-        reward: Tensor,
-        next_observation: Tensor,
-        done: Tensor,
-    ):
-        self.observation[self.buffer_index] = observation.detach().cpu().numpy()
-        self.action[self.buffer_index] = action.detach().cpu().numpy()
-        self.reward[self.buffer_index] = reward.detach().cpu().numpy()
-        self.next_observation[self.buffer_index] = next_observation.detach().cpu().numpy()
-        self.done[self.buffer_index] = done.detach().cpu().numpy()
+    def add(self, observation: Tensor, action: Tensor, reward: Tensor, next_observation: Tensor, done: Tensor):
+        B = observation.shape[0]
+        indices = (self.buffer_index + np.arange(B)) % self.capacity
+        self.observation[indices] = observation.detach().cpu().numpy()
+        self.action[indices] = action.detach().cpu().numpy()
+        self.reward[indices] = reward.unsqueeze(-1).detach().cpu().numpy()
+        self.next_observation[indices] = next_observation.detach().cpu().numpy()
+        self.done[indices] = done.unsqueeze(-1).detach().cpu().numpy()
 
-        self.buffer_index = (self.buffer_index + 1) % self.capacity
-        self.full = self.full or self.buffer_index == 0
+        self.full = self.full or self.buffer_index + B >= self.capacity
+        self.buffer_index = (self.buffer_index + B) % self.capacity
 
     def sample(self, batch_size, chunk_size) -> dict[str, Tensor]:
         """
@@ -477,15 +472,15 @@ cnt_episode = 0
 def rollout(envs, num_episodes: int):
     global cnt_episode
     for epi in range(num_episodes):
-        posterior = torch.zeros(1, args.stochastic_size, device=device)
-        deterministic = torch.zeros(1, args.deterministic_size, device=device)
-        action = torch.zeros(1, envs.single_action_space.shape[0], device=device)
+        posterior = torch.zeros(args.num_envs, args.stochastic_size, device=device)
+        deterministic = torch.zeros(args.num_envs, args.deterministic_size, device=device)
+        action = torch.zeros(args.num_envs, envs.single_action_space.shape[0], device=device)
         obs, _ = envs.reset()
         reward_sum = torch.zeros(envs.num_envs, device=device)
         while True:
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
-            _, posterior = representation_model(embeded_obs.view(1, -1), deterministic)
+            _, posterior = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
             action = actor(posterior, deterministic).detach()
             next_obs, reward, terminated, truncated, info = envs.step(action)
             reward_sum += reward
@@ -494,7 +489,7 @@ def rollout(envs, num_episodes: int):
             obs = next_obs
             if done.all():
                 break
-        cnt_episode += 1
+        cnt_episode += args.num_envs
         print(f"Episode {cnt_episode}, Return: {reward_sum.mean().item()}")
         writer.add_scalar("charts/episodic_return", reward_sum.mean().item(), cnt_episode)
 
