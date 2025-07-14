@@ -3,29 +3,29 @@ name = "rvrl"
 version = "0.0.1"
 requires-python = ">=3.8"
 dependencies = [
-    "gymnasium",
+    "gymnasium==0.29.1",
     "loguru",
     "rich",
-    "rootutils",
+    "tensorboard",
     "torch",
     "torchvision",
     "tqdm",
     "tyro",
-    "tensorboard",
 ]
 
 [project.optional-dependencies]
-dm_control = [
+dmc = [
     "dm_control==1.0.11",
-    "shimmy==1.1.0",
     "mujoco==2.3.3",
-    "gymnasium<1",
-    "numpy<2",
 ]
 isaaclab = [
-    "torch==2.5.1+cu118",
-    "torchvision==0.20.1+cu118",
+    "torch==2.5.1+cu121",
+    "torchvision==0.20.1+cu121",
     "isaacsim[all,extscache]==4.5.0",
+]
+isaacgym = [
+    "isaacgym @ file:${PROJECT_ROOT}/third_party/isaacgym/python",
+    "IsaacGymEnvs @ file:${PROJECT_ROOT}/third_party/IsaacGymEnvs",
 ]
 
 [tool.ruff]
@@ -55,11 +55,11 @@ lint.ignore = [
 "src/envs/isaaclab_env.py" = ["FA"]  # isaaclab only supports Python 3.10
 
 [tool.uv]
-index-strategy = "unsafe-best-match"
+index-strategy = "unsafe-first-match"
 
 [tool.uv.pip]
 extra-index-url = [
     "https://pypi.org/simple",
-    "https://download.pytorch.org/whl/cu118",
+    "https://download.pytorch.org/whl/cu121",
     "https://pypi.nvidia.com",
 ]
