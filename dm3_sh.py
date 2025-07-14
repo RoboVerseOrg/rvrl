@@ -161,21 +161,22 @@ def compute_lambda_values(
 @dataclass
 class Args:
     env_id: str = "dm_control/walker-walk-v0"
-    exp_name: str = "dreamerv1"
-    num_envs: int = 1
+    exp_name: str = "dreamerv3"
+    num_envs: int = 4
     seed: int = 0
     device: str = "cuda"
-    model_lr: float = 6e-4
-    actor_lr: float = 8e-5
-    critic_lr: float = 8e-5
+    model_lr: float = 1e-4  # y
+    actor_lr: float = 8e-5  # y
+    critic_lr: float = 8e-5  # y
     num_iterations: int = 1000
-    batch_size: int = 50
+    batch_size: int = 16
     batch_length: int = 50
     stochastic_size: int = 30
     deterministic_size: int = 200
     embedded_obs_size: int = 1024
     horizon: int = 15
     gae_lambda: float = 0.95
+    prefill: int = 1000
 
 
 args = tyro.cli(Args)
@@ -378,7 +379,7 @@ writer.add_text(
     "hyperparameters",
     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
 )
-buffer = ReplayBuffer(envs.single_observation_space.shape, envs.single_action_space.shape[0], device)
+buffer = ReplayBuffer(envs.single_observation_space.shape, envs.single_action_space.shape[0], device, capacity=500_000)
 
 ## networks
 encoder = Encoder().to(device)
@@ -397,16 +398,16 @@ model_params = chain(
     representation_model.parameters(),
     reward_predictor.parameters(),
 )
-model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr)
-actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=1e-8)
+actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=1e-5)
+critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=1e-5)
 cnt_episode = 0
 
 
 @torch.inference_mode()
-def rollout(envs, num_episodes: int):
+def rollout(envs, rounds: int):
     global cnt_episode
-    for epi in range(num_episodes):
+    for _ in range(rounds):
         posterior = torch.zeros(args.num_envs, args.stochastic_size, device=device)
         deterministic = torch.zeros(args.num_envs, args.deterministic_size, device=device)
         action = torch.zeros(args.num_envs, envs.single_action_space.shape[0], device=device)
@@ -523,7 +524,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
 def main():
     ## rollout before training
     tic = time.time()
-    rollout(envs, 5)
+    rollout(envs, args.prefill // args.num_envs)
     toc = time.time()
     log.info(f"Time taken for pre-rollout: {toc - tic:.2f} seconds")
     log.info(f"Pre-collected buffer size: {len(buffer)}")
