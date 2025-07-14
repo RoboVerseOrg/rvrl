@@ -24,7 +24,16 @@ import tyro
 from loguru import logger as log
 from rich.logging import RichHandler
 from torch import Tensor
-from torch.distributions import Distribution, Independent, Normal, TanhTransform, TransformedDistribution, kl_divergence
+from torch.distributions import (
+    Distribution,
+    Independent,
+    Normal,
+    OneHotCategoricalStraightThrough,
+    TanhTransform,
+    TransformedDistribution,
+    kl_divergence,
+)
+from torch.distributions.utils import probs_to_logits
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from src.envs.env_factory import create_vector_env
@@ -169,14 +178,26 @@ class Args:
     actor_lr: float = 8e-5  # y
     critic_lr: float = 8e-5  # y
     num_iterations: int = 1000
-    batch_size: int = 16
-    batch_length: int = 50
-    stochastic_size: int = 30
-    deterministic_size: int = 200
+    batch_size: int = 16  # y
+    batch_length: int = 64  # y
+    stochastic_length: int = 32  # y
+    stochastic_classes: int = 32  # y
+    deterministic_size: int = 512  # y
     embedded_obs_size: int = 1024
     horizon: int = 15
     gae_lambda: float = 0.95
     prefill: int = 1000
+    debug: bool = False
+    train_per_rollout: int = 100
+
+    @property
+    def stochastic_size(self):
+        return self.stochastic_length * self.stochastic_classes
+
+    def __post_init__(self):
+        if self.debug:
+            self.prefill = self.num_envs
+            self.train_per_rollout = 1
 
 
 args = tyro.cli(Args)
@@ -259,41 +280,47 @@ class RecurrentModel(nn.Module):
         return x
 
 
+def _unimix(logits: Tensor) -> Tensor:
+    probs = logits.softmax(dim=-1)
+    uniform = torch.ones_like(probs) / args.stochastic_classes
+    probs = 0.99 * probs + 0.01 * uniform
+    logits = probs_to_logits(probs)
+    return logits
+
+
 class TransitionModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(args.deterministic_size, 200),
-            nn.ELU(),
-            nn.Linear(200, args.stochastic_size * 2),
+            nn.Linear(args.deterministic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.stochastic_size),
         )
-        self.net.apply(initialize_weights)
 
     def forward(self, deterministic: Tensor) -> tuple[Distribution, Tensor]:
-        mean, std = self.net(deterministic).chunk(2, dim=1)
-        std = F.softplus(std) + 0.1  # XXX: why add 0.1?
-        prior_dist = Normal(mean, std)
-        prior = prior_dist.rsample()
-        return prior_dist, prior
+        logits = self.net(deterministic).view(-1, args.stochastic_length, args.stochastic_classes)
+        logits = _unimix(logits)
+        dist = Independent(OneHotCategoricalStraightThrough(logits=logits), 1)
+        return dist, logits.view(-1, args.stochastic_size)
 
 
 class RepresentationModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(args.embedded_obs_size + args.deterministic_size, 200),
-            nn.ELU(),
-            nn.Linear(200, args.stochastic_size * 2),
+            nn.Linear(args.embedded_obs_size + args.deterministic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.stochastic_size),
         )
-        self.net.apply(initialize_weights)
 
     def forward(self, embedded_obs: Tensor, deterministic: Tensor) -> tuple[Distribution, Tensor]:
         x = torch.cat([embedded_obs, deterministic], dim=1)
-        mean, std = self.net(x).chunk(2, dim=1)
-        std = F.softplus(std) + 0.1  # XXX: why add 0.1?
-        posterior_dist = Normal(mean, std)
-        posterior = posterior_dist.rsample()
-        return posterior_dist, posterior
+        logits = self.net(x).view(-1, args.stochastic_length, args.stochastic_classes)
+        logits = _unimix(logits)
+        dist = Independent(OneHotCategoricalStraightThrough(logits=logits), 1)
+        return dist, logits.view(-1, args.stochastic_size)
 
 
 class RewardPredictor(nn.Module):
@@ -435,51 +462,49 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
     embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
 
-    priors = []
-    prior_means = []
-    prior_stds = []
-    posteriors = []
-    posterior_means = []
-    posterior_stds = []
     deterministics = []
+    priors_logits = []
+    posteriors = []
+    posteriors_logits = []
     for t in range(1, args.batch_length):
         deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
-        prior_dist, prior = transition_model(deterministic)
-        posterior_dist, posterior = representation_model(embeded_obs[:, t], deterministic)
+        prior_dist, prior_logits = transition_model(deterministic)
+        posterior_dist, posterior_logits = representation_model(embeded_obs[:, t], deterministic)
 
-        priors.append(prior)
-        prior_means.append(prior_dist.mean)
-        prior_stds.append(prior_dist.scale)
-        posteriors.append(posterior)
-        posterior_means.append(posterior_dist.mean)
-        posterior_stds.append(posterior_dist.scale)
         deterministics.append(deterministic)
+        priors_logits.append(prior_logits)
+        posteriors.append(posterior_dist.rsample().view(-1, args.stochastic_size))
+        posteriors_logits.append(posterior_logits)
 
-    priors = torch.stack(priors, dim=1).to(device)
-    prior_means = torch.stack(prior_means, dim=1).to(device)
-    prior_stds = torch.stack(prior_stds, dim=1).to(device)
-    posteriors = torch.stack(posteriors, dim=1).to(device)
-    posterior_means = torch.stack(posterior_means, dim=1).to(device)
-    posterior_stds = torch.stack(posterior_stds, dim=1).to(device)
     deterministics = torch.stack(deterministics, dim=1).to(device)
+    prior_logits = torch.stack(priors_logits, dim=1).to(device)
+    posteriors = torch.stack(posteriors, dim=1).to(device)
+    posteriors_logits = torch.stack(posteriors_logits, dim=1).to(device)
 
     reconstructed_obs_dist = decoder(posteriors, deterministics)
     reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
     reward_dist = reward_predictor(posteriors, deterministics)
     reward_loss = -reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
-    ## XXX: why recreate the distribution? what does Independent do?
-    prior_dist = Independent(Normal(prior_means, prior_stds), 1)
-    posterior_dist = Independent(Normal(posterior_means, posterior_stds), 1)
-    kl_loss = kl_divergence(posterior_dist, prior_dist).mean()
-    kl_loss = torch.max(kl_loss, torch.tensor(3.0, device=device))
+    # KL balancing
+    kl_loss1 = kl_divergence(
+        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1),
+    )
+    kl_loss1 = torch.max(kl_loss1, torch.tensor(1.0, device=device))
+    kl_loss2 = kl_divergence(
+        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
+    )
+    kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
+    kl_loss = (1.0 * kl_loss1 + 0.1 * kl_loss2).mean()
 
     ## TODO: add coefficients for loss terms
     model_loss = reconstructed_obs_loss + reward_loss + kl_loss
 
     model_optimizer.zero_grad()
     model_loss.backward()
-    nn.utils.clip_grad_norm_(model_params, 100)
+    nn.utils.clip_grad_norm_(model_params, 1000)
     model_optimizer.step()
 
     return posteriors, deterministics
@@ -532,7 +557,7 @@ def main():
     ## training loop
     for iteration in range(args.num_iterations):
         tic = time.time()
-        for sample_index in range(100):
+        for sample_index in range(args.train_per_rollout):
             data = buffer.sample(args.batch_size, args.batch_length)
             posteriors, deterministics = dynamic_learning(data)
             behavior_learning(posteriors, deterministics)
