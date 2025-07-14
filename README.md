@@ -28,9 +28,11 @@ wget https://developer.nvidia.com/isaac-gym-preview-4 \
     && tar -xf isaac-gym-preview-4 \
     && rm isaac-gym-preview-4
 find isaacgym/python -type f -name "*.py" -exec sed -i 's/np\.float/np.float32/g' {} +
+uv pip install isaacgym/python
 git clone --depth 1 https://github.com/isaac-sim/IsaacGymEnvs
+cd IsaacGymEnvs && uv pip install -e . && cd ..
 cd ..
-uv pip install -e ".[isaacgym]"
+uv pip install networkx==2.1
 ```
 
 ## Usage
