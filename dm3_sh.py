@@ -29,8 +29,6 @@ from torch.distributions import (
     Independent,
     Normal,
     OneHotCategoricalStraightThrough,
-    TanhTransform,
-    TransformedDistribution,
     kl_divergence,
 )
 from torch.distributions.utils import probs_to_logits
@@ -545,21 +543,23 @@ class Actor(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.actor = nn.Sequential(
-            nn.Linear(args.deterministic_size + args.stochastic_size, 400),
-            nn.ELU(),
-            nn.Linear(400, envs.single_action_space.shape[0] * 2),
+            nn.Linear(args.deterministic_size + args.stochastic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, envs.single_action_space.shape[0] * 2),
         )
-        self.actor.apply(initialize_weights)
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         x = torch.cat([posterior, deterministic], dim=-1)
         mean, std = self.actor(x).chunk(2, dim=-1)
-        mean = 5 * F.tanh(mean / 5)  # XXX: what is this?
-        std = F.softplus(std + 5) + 1e-4  # XXX: why add 5? why add 1e-4?
-        action_dist = TransformedDistribution(Normal(mean, std), TanhTransform())  # XXX: why use TanhTransform?
-        action_dist = Independent(action_dist, 1)
-        action = action_dist.rsample()  #! important to use rsample()
-        return action
+        std_min, std_max = 0.1, 1
+        mean = F.tanh(mean)
+        std = std_min + (std_max - std_min) * F.sigmoid(std + 2.0)
+        action_dist = Independent(Normal(mean, std), 1)
+        return action_dist
 
 
 class Critic(nn.Module):
@@ -638,7 +638,7 @@ def rollout(envs, rounds: int):
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
             _, posterior = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
-            action = actor(posterior, deterministic).detach()
+            action = actor(posterior, deterministic).sample()
             next_obs, reward, terminated, truncated, info = envs.step(action)
             reward_sum += reward
             done = torch.logical_or(terminated, truncated)
@@ -717,7 +717,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     states = []
     deterministics = []
     for t in range(args.horizon):
-        action = actor(state, deterministic)  # XXX: why don't use prior? previously used prior
+        action = actor(state, deterministic).rsample()
         deterministic = recurrent_model(state, action, deterministic)
         _, state = transition_model(deterministic)
         states.append(state)
