@@ -284,6 +284,74 @@ class LayerNormGRUCell(nn.Module):
         return hx
 
 
+# From https://github.com/danijar/dreamerv3/blob/8fa35f83eee1ce7e10f3dee0b766587d0a713a60/dreamerv3/jaxutils.py
+def symlog(x: Tensor) -> Tensor:
+    return torch.sign(x) * torch.log(1 + torch.abs(x))
+
+
+def symexp(x: Tensor) -> Tensor:
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
+
+class TwoHotEncodingDistribution:
+    """
+    Copied from https://github.com/Eclectic-Sheep/sheeprl/blob/33b636681fd8b5340b284f2528db8821ab8dcd0b/sheeprl/utils/distribution.py#L224
+    """
+
+    def __init__(
+        self,
+        logits: Tensor,
+        dims: int = 0,
+        low: int = -20,
+        high: int = 20,
+        transfwd: Callable[[Tensor], Tensor] = symlog,
+        transbwd: Callable[[Tensor], Tensor] = symexp,
+    ):
+        self.logits = logits
+        self.probs = F.softmax(logits, dim=-1)
+        self.dims = tuple([-x for x in range(1, dims + 1)])
+        self.bins = torch.linspace(low, high, logits.shape[-1], device=logits.device)
+        self.low = low
+        self.high = high
+        self.transfwd = transfwd
+        self.transbwd = transbwd
+        self._batch_shape = logits.shape[: len(logits.shape) - dims]
+        self._event_shape = logits.shape[len(logits.shape) - dims : -1] + (1,)
+
+    @property
+    def mean(self) -> Tensor:
+        return self.transbwd((self.probs * self.bins).sum(dim=self.dims, keepdim=True))
+
+    @property
+    def mode(self) -> Tensor:
+        return self.transbwd((self.probs * self.bins).sum(dim=self.dims, keepdim=True))
+
+    def log_prob(self, x: Tensor) -> Tensor:
+        x = self.transfwd(x)
+        # below in [-1, len(self.bins) - 1]
+        below = (self.bins <= x).type(torch.int32).sum(dim=-1, keepdim=True) - 1
+        # above in [0, len(self.bins)]
+        above = below + 1
+
+        # above in [0, len(self.bins) - 1]
+        above = torch.minimum(above, torch.full_like(above, len(self.bins) - 1))
+        # below in [0, len(self.bins) - 1]
+        below = torch.maximum(below, torch.zeros_like(below))
+
+        equal = below == above
+        dist_to_below = torch.where(equal, 1, torch.abs(self.bins[below] - x))
+        dist_to_above = torch.where(equal, 1, torch.abs(self.bins[above] - x))
+        total = dist_to_below + dist_to_above
+        weight_below = dist_to_above / total
+        weight_above = dist_to_below / total
+        target = (
+            F.one_hot(below, len(self.bins)) * weight_below[..., None]
+            + F.one_hot(above, len(self.bins)) * weight_above[..., None]
+        ).squeeze(-2)
+        log_pred = self.logits - torch.logsumexp(self.logits, dim=-1, keepdim=True)
+        return (target * log_pred).sum(dim=self.dims)
+
+
 ########################################################
 ## Args
 ########################################################
@@ -309,6 +377,7 @@ class Args:
     prefill: int = 1000
     debug: bool = False
     train_per_rollout: int = 100
+    bins = 256  # y
 
     @property
     def stochastic_size(self):
@@ -453,24 +522,23 @@ class RewardPredictor(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(args.deterministic_size + args.stochastic_size, 200),
-            nn.ELU(),
-            nn.Linear(200, 1),
+            nn.Linear(args.deterministic_size + args.stochastic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.bins),
         )
-        self.net.apply(initialize_weights)
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
-        # posterior: (batch_size, batch_length-1, stochastic_size)
-        # deterministic: (batch_size, batch_length-1, deterministic_size)
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         input_shape = posterior.shape
         posterior = posterior.flatten(0, 1)
         deterministic = deterministic.flatten(0, 1)
         x = torch.cat([posterior, deterministic], dim=1)
-        mean = self.net(x)
-        mean = mean.unflatten(0, input_shape[:2])
-        std = 1  # XXX: why std is 1?
-        reward_dist = Independent(Normal(mean, std), 1)
-        return reward_dist
+        predicted_reward_bins = self.net(x)
+        predicted_reward_bins = predicted_reward_bins.unflatten(0, input_shape[:2])
+        return predicted_reward_bins
 
 
 class Actor(nn.Module):
@@ -613,8 +681,9 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     )  # 3 is number of dimensions for observation space, shape is (3, H, W)
     reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
 
-    reward_dist = reward_predictor(posteriors, deterministics)
-    reward_loss = -reward_dist.log_prob(data["reward"][:, 1:]).mean()
+    predicted_reward_bins = reward_predictor(posteriors, deterministics)
+    predicted_reward_dist = TwoHotEncodingDistribution(predicted_reward_bins, dims=1)
+    reward_loss = -predicted_reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
     # KL balancing
     kl_loss1 = kl_divergence(
@@ -656,7 +725,8 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
 
     states = torch.stack(states, dim=1)
     deterministics = torch.stack(deterministics, dim=1)
-    predicted_rewards = reward_predictor(states, deterministics).mean
+
+    predicted_rewards = TwoHotEncodingDistribution(reward_predictor(states, deterministics), dims=1).mean
     values = critic(states, deterministics).mean
     continues = torch.ones_like(values) * 0.99
     lambda_values = compute_lambda_values(predicted_rewards, values, continues, args.horizon, device, args.gae_lambda)
