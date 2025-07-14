@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
-from typing import Sequence
+from typing import Any, Callable, Sequence
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic run
@@ -204,6 +204,86 @@ class MSEDistribution:
         return -loss
 
 
+class LayerNormGRUCell(nn.Module):
+    """A GRU cell with a LayerNorm
+    copied from https://github.com/Eclectic-Sheep/sheeprl/blob/4441dbf4bcd7ae0daee47d35fb0660bc1fe8bd4b/sheeprl/models/models.py#L331
+    which was taken from https://github.com/danijar/dreamerv2/blob/main/dreamerv2/common/nets.py#L317.
+
+    This particular GRU cell accepts 3-D inputs, with a sequence of length 1, and applies
+    a LayerNorm after the projection of the inputs.
+
+    Args:
+        input_size (int): the input size.
+        hidden_size (int): the hidden state size
+        bias (bool, optional): whether to apply a bias to the input projection.
+            Defaults to True.
+        batch_first (bool, optional): whether the first dimension represent the batch dimension or not.
+            Defaults to False.
+        layer_norm_cls (Callable[..., nn.Module]): the layer norm to apply after the input projection.
+            Defaults to nn.Identiy.
+        layer_norm_kw (Dict[str, Any]): the kwargs of the layer norm.
+            Default to {}.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        batch_first: bool = False,
+        layer_norm_cls: Callable[..., nn.Module] = nn.Identity,
+        layer_norm_kw: dict[str, Any] = {},
+    ) -> None:
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        self.batch_first = batch_first
+        self.linear = nn.Linear(input_size + hidden_size, 3 * hidden_size, bias=self.bias)
+        # Avoid multiple values for the `normalized_shape` argument
+        layer_norm_kw.pop("normalized_shape", None)
+        self.layer_norm = layer_norm_cls(3 * hidden_size, **layer_norm_kw)
+
+    def forward(self, input: Tensor, hx: Tensor) -> Tensor:
+        is_3d = input.dim() == 3
+        if is_3d:
+            if input.shape[int(self.batch_first)] == 1:
+                input = input.squeeze(int(self.batch_first))
+            else:
+                raise AssertionError(
+                    "LayerNormGRUCell: Expected input to be 3-D with sequence length equal to 1 but received "
+                    f"a sequence of length {input.shape[int(self.batch_first)]}"
+                )
+        if hx.dim() == 3:
+            hx = hx.squeeze(0)
+        assert input.dim() in (
+            1,
+            2,
+        ), f"LayerNormGRUCell: Expected input to be 1-D or 2-D but received {input.dim()}-D tensor"
+
+        is_batched = input.dim() == 2
+        if not is_batched:
+            input = input.unsqueeze(0)
+
+        hx = hx.unsqueeze(0) if not is_batched else hx
+
+        input = torch.cat((hx, input), -1)
+        x = self.linear(input)
+        x = self.layer_norm(x)
+        reset, cand, update = torch.chunk(x, 3, -1)
+        reset = torch.sigmoid(reset)
+        cand = torch.tanh(reset * cand)
+        update = torch.sigmoid(update - 1)
+        hx = update * cand + (1 - update) * hx
+
+        if not is_batched:
+            hx = hx.squeeze(0)
+        elif is_3d:
+            hx = hx.unsqueeze(0)
+
+        return hx
+
+
 ########################################################
 ## Args
 ########################################################
@@ -310,13 +390,18 @@ class Decoder(nn.Module):
 class RecurrentModel(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.linear = nn.Linear(args.stochastic_size + envs.single_action_space.shape[0], 200)
-        self.act = nn.ELU()
-        self.recurrent = nn.GRUCell(200, args.deterministic_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(args.stochastic_size + envs.single_action_space.shape[0], 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+        )
+        self.recurrent = LayerNormGRUCell(
+            512, args.deterministic_size, bias=False, layer_norm_cls=nn.LayerNorm, layer_norm_kw={"eps": 1e-3}
+        )
 
     def forward(self, state: Tensor, action: Tensor, deterministic: Tensor) -> Tensor:
         x = torch.cat([state, action], dim=1)
-        x = self.act(self.linear(x))
+        x = self.mlp(x)
         x = self.recurrent(x, deterministic)
         return x
 
