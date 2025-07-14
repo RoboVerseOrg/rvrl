@@ -164,6 +164,46 @@ def compute_lambda_values(
     return returns
 
 
+class LayerNormChannelLast(nn.LayerNorm):
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = super().forward(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+
+class MSEDistribution:
+    """
+    Copied from https://github.com/Eclectic-Sheep/sheeprl/blob/33b636681fd8b5340b284f2528db8821ab8dcd0b/sheeprl/utils/distribution.py#L196
+    """
+
+    def __init__(self, mode: Tensor, dims: int, agg: str = "sum"):
+        self._mode = mode
+        self._dims = tuple([-x for x in range(1, dims + 1)])
+        self._agg = agg
+        self._batch_shape = mode.shape[: len(mode.shape) - dims]
+        self._event_shape = mode.shape[len(mode.shape) - dims :]
+
+    @property
+    def mode(self) -> Tensor:
+        return self._mode
+
+    @property
+    def mean(self) -> Tensor:
+        return self._mode
+
+    def log_prob(self, value: Tensor) -> Tensor:
+        assert self._mode.shape == value.shape, (self._mode.shape, value.shape)
+        distance = (self._mode - value) ** 2
+        if self._agg == "mean":
+            loss = distance.mean(self._dims)
+        elif self._agg == "sum":
+            loss = distance.sum(self._dims)
+        else:
+            raise NotImplementedError(self._agg)
+        return -loss
+
+
 ########################################################
 ## Args
 ########################################################
@@ -183,7 +223,7 @@ class Args:
     stochastic_length: int = 32  # y
     stochastic_classes: int = 32  # y
     deterministic_size: int = 512  # y
-    embedded_obs_size: int = 1024
+    embedded_obs_size: int = 4096  # y = 256 * 4 * 4
     horizon: int = 15
     gae_lambda: float = 0.95
     prefill: int = 1000
@@ -216,54 +256,55 @@ def initialize_weights(m: nn.Module):
 
 
 class Encoder(nn.Module):
+    ## HACK: the output size is 4096, which should be equal to args.embedded_obs_size
     def __init__(self):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2),
-            nn.ReLU(),
+            nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(32, eps=1e-3),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(64, eps=1e-3),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(128, eps=1e-3),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(256, eps=1e-3),
+            nn.SiLU(),
         )
-        self.encoder.apply(initialize_weights)
 
     def forward(self, obs: Tensor) -> Tensor:
         B = obs.shape[0]
         embedded_obs = self.encoder(obs)
-        return embedded_obs.view(B, -1)
+        return embedded_obs.reshape(B, -1)  # flatten the last 3 dimensions C, H, W
 
 
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.decoder = nn.Sequential(
-            nn.Linear(args.deterministic_size + args.stochastic_size, 1024),
-            nn.Unflatten(1, (1024, 1, 1)),  # XXX: why 1024?
-            nn.ConvTranspose2d(1024, 128, kernel_size=5, stride=2),
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=5, stride=2),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=6, stride=2),
-            nn.ReLU(),
-            nn.ConvTranspose2d(32, 3, kernel_size=6, stride=2),
+            nn.Linear(args.deterministic_size + args.stochastic_size, 4096),
+            nn.Unflatten(1, (256, 4, 4)),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(128, eps=1e-3),
+            nn.SiLU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(64, eps=1e-3),
+            nn.SiLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(32, eps=1e-3),
+            nn.SiLU(),
+            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),
         )
-        self.decoder.apply(initialize_weights)
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
-        # posterior: (batch_size, batch_length-1, stochastic_size)
-        # deterministic: (batch_size, batch_length-1, deterministic_size)
-        input_shape = posterior.shape
-        posterior = posterior.flatten(0, 1)
-        deterministic = deterministic.flatten(0, 1)
-        x = torch.cat([posterior, deterministic], dim=1)
-        mean = self.decoder(x)
-        mean = mean.unflatten(0, input_shape[:2])
-        std = 1  # XXX: why std is 1?
-        dist = Independent(Normal(mean, std), 3)  # 3 is number of dimensions for observation space, shape is (3, H, W)
-        return dist
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
+        x = torch.cat([posterior, deterministic], dim=-1)
+        input_shape = x.shape
+        x = x.flatten(0, 1)
+        reconstructed_obs = self.decoder(x)
+        reconstructed_obs = reconstructed_obs.unflatten(0, input_shape[:2])
+        return reconstructed_obs
 
 
 class RecurrentModel(nn.Module):
@@ -481,8 +522,12 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     posteriors = torch.stack(posteriors, dim=1).to(device)
     posteriors_logits = torch.stack(posteriors_logits, dim=1).to(device)
 
-    reconstructed_obs_dist = decoder(posteriors, deterministics)
+    reconstructed_obs = decoder(posteriors, deterministics)
+    reconstructed_obs_dist = MSEDistribution(
+        reconstructed_obs, 3
+    )  # 3 is number of dimensions for observation space, shape is (3, H, W)
     reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
+
     reward_dist = reward_predictor(posteriors, deterministics)
     reward_loss = -reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
@@ -497,7 +542,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
     )
     kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
-    kl_loss = (1.0 * kl_loss1 + 0.1 * kl_loss2).mean()
+    kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
 
     ## TODO: add coefficients for loss terms
     model_loss = reconstructed_obs_loss + reward_loss + kl_loss
