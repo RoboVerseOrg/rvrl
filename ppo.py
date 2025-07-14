@@ -133,9 +133,10 @@ def main():
 
     # Use the unified environment interface
     envs = create_vector_env(
-        env_id=args.env_id,
-        num_envs=args.num_envs,
-        seed=args.seed,
+        args.env_id,
+        "proprio",
+        args.num_envs,
+        args.seed,
         capture_video=args.capture_video,
         run_name=run_name,
         device=args.device,
@@ -144,7 +145,7 @@ def main():
     log.info(f"{envs.single_action_space.shape=}")
     log.info(f"{envs.single_observation_space.shape=}")
 
-    obs, _ = envs.reset(seed=args.seed)
+    obs, _ = envs.reset()
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.lr, eps=1e-5)
 

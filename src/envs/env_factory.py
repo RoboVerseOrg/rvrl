@@ -65,7 +65,18 @@ def create_vector_env(
     """
     if env_id.startswith("dm_control/"):
         if obs_type == "proprio":
-            env_fns = [make_env(env_id, i, capture_video and i == 0, run_name, **kwargs) for i in range(num_envs)]
+            from .dmc_env import DMControlProprioEnv
+
+            env_fns = [
+                lambda: gym.wrappers.FlattenObservation(
+                    DMControlProprioEnv(
+                        env_id.replace("dm_control/", ""),
+                        seed + i * SEED_SPACING,
+                        action_repeat=action_repeat,
+                    )
+                )
+                for i in range(num_envs)
+            ]
             envs = gym.vector.SyncVectorEnv(env_fns)
             envs = NumpyToTorch(envs, device)
             return envs
