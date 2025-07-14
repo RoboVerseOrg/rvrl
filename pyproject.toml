@@ -33,6 +33,26 @@ line-length = 120
 format.preview = true
 lint.preview = false
 target-version = "py38"
+lint.select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "FA",   # flake8: future annotations
+    "UP",   # pyupgrade
+    "NPY",  # numpy-specific rules
+]
+lint.ignore = [
+    "E266",  # allow multiple leading # in comments
+    "E402",  # allow imports not at the top of the file
+    "E501",  # allow long lines
+    "E722",  # allow bare except
+    "F403",  # allow `from module import *`
+    "F841",  # allow unused variable
+    "UP031",  # allow `%` to be used to format strings
+    "NPY002",  # allow legacy `numpy.random` functions
+]
+
+[tool.ruff.lint.per-file-ignores]
+"src/envs/isaaclab_env.py" = ["FA"]  # isaaclab only supports Python 3.10
 
 [tool.uv]
 index-strategy = "unsafe-best-match"

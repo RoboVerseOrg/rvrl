@@ -6,7 +6,6 @@ from isaaclab.app import AppLauncher
 app_launcher = AppLauncher(headless=True)
 simulation_app = app_launcher.app
 
-import isaaclab_tasks
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 

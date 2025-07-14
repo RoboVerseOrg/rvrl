@@ -1,6 +1,4 @@
-import isaacgym
 import rootutils
-import torch
 
 rootutils.setup_root(__file__, pythonpath=True)
 from src.envs.isaacgym_env import IsaacGymEnv

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 try:
-    import isaacgym
+    import isaacgym  # noqa: F401
 except ImportError:
     pass
 

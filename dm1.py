@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 try:
-    import isaacgym
+    import isaacgym  # noqa: F401
 except ImportError:
     pass
 
@@ -50,7 +50,7 @@ def enable_deterministic_run():
     torch.use_deterministic_algorithms(True)
 
 
-class ReplayBuffer(object):
+class ReplayBuffer:
     def __init__(
         self, observation_shape: Sequence[int], action_size: int, device: str | torch.device, capacity: int = 5000000
     ):
