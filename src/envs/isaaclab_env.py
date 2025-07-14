@@ -3,13 +3,15 @@ from typing import Any
 import gymnasium as gym
 from isaaclab.app import AppLauncher
 
+from src.envs import BaseVecEnv
+
 app_launcher = AppLauncher(headless=True)
 simulation_app = app_launcher.app
 
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
 
 
-class IsaacLabEnv:
+class IsaacLabEnv(BaseVecEnv):
     def __init__(self, task_name: str, num_envs: int = 1, seed: int = 0):
         env_cfg = parse_env_cfg(task_name, device="cuda", num_envs=num_envs)
         env_cfg.seed = seed

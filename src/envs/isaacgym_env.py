@@ -8,8 +8,10 @@ from isaacgymenvs.tasks import isaacgym_task_map
 from isaacgymenvs.tasks.base.vec_task import VecTask
 from isaacgymenvs.utils.reformat import omegaconf_to_dict
 
+from src.envs import BaseVecEnv
 
-class IsaacGymEnv:
+
+class IsaacGymEnv(BaseVecEnv):
     def __init__(self, task_name: str, num_envs: int = 1, seed: int = 0, device: str = "cuda"):
         with hydra.initialize(config_path="../../refs/minimal-stable-PPO/configs"):
             cfg = hydra.compose(config_name="config", overrides=[f"task={task_name.replace('isaacgymenv/', '')}"])

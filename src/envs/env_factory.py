@@ -6,6 +6,7 @@ from typing import Literal
 
 import gymnasium as gym
 
+from src.envs import BaseVecEnv
 from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
 
 SEED_SPACING = 1_000_000
@@ -44,7 +45,7 @@ def create_vector_env(
     run_name: str = "",
     device: str = "cuda",
     **kwargs,
-):
+) -> BaseVecEnv:
     """
     Create a vectorized environment.
 
