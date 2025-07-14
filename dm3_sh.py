@@ -393,13 +393,51 @@ args = tyro.cli(Args)
 ########################################################
 ## Networks
 ########################################################
-def initialize_weights(m: nn.Module):
-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
-        nn.init.kaiming_uniform_(m.weight.data, nonlinearity="relu")
-        nn.init.constant_(m.bias.data, 0)
-    elif isinstance(m, nn.Linear):
-        nn.init.kaiming_uniform_(m.weight.data)
-        nn.init.constant_(m.bias.data, 0)
+# Adapted from: https://github.com/NM512/dreamerv3-torch/blob/main/tools.py#L929
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        in_num = m.in_features
+        out_num = m.out_features
+        denoms = (in_num + out_num) / 2.0
+        scale = 1.0 / denoms
+        std = np.sqrt(scale) / 0.87962566103423978
+        nn.init.trunc_normal_(m.weight.data, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
+        if hasattr(m.bias, "data"):
+            m.bias.data.fill_(0.0)
+    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+        space = m.kernel_size[0] * m.kernel_size[1]
+        in_num = space * m.in_channels
+        out_num = space * m.out_channels
+        denoms = (in_num + out_num) / 2.0
+        scale = 1.0 / denoms
+        std = np.sqrt(scale) / 0.87962566103423978
+        nn.init.trunc_normal_(m.weight.data, mean=0.0, std=std, a=-2.0, b=2.0)
+        if hasattr(m.bias, "data"):
+            m.bias.data.fill_(0.0)
+    elif isinstance(m, nn.LayerNorm):
+        m.weight.data.fill_(1.0)
+        if hasattr(m.bias, "data"):
+            m.bias.data.fill_(0.0)
+
+
+# Adapted from: https://github.com/NM512/dreamerv3-torch/blob/main/tools.py#L957
+def uniform_init_weights(given_scale):
+    def f(m):
+        if isinstance(m, nn.Linear):
+            in_num = m.in_features
+            out_num = m.out_features
+            denoms = (in_num + out_num) / 2.0
+            scale = given_scale / denoms
+            limit = np.sqrt(3 * scale)
+            nn.init.uniform_(m.weight.data, a=-limit, b=limit)
+            if hasattr(m.bias, "data"):
+                m.bias.data.fill_(0.0)
+        elif isinstance(m, nn.LayerNorm):
+            m.weight.data.fill_(1.0)
+            if hasattr(m.bias, "data"):
+                m.bias.data.fill_(0.0)
+
+    return f
 
 
 class Encoder(nn.Module):
@@ -420,6 +458,7 @@ class Encoder(nn.Module):
             LayerNormChannelLast(256, eps=1e-3),
             nn.SiLU(),
         )
+        self.encoder.apply(init_weights)
 
     def forward(self, obs: Tensor) -> Tensor:
         B = obs.shape[0]
@@ -444,6 +483,8 @@ class Decoder(nn.Module):
             nn.SiLU(),
             nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),
         )
+        [m.apply(init_weights) for m in self.decoder[:-1]]
+        self.decoder[-1].apply(uniform_init_weights(1.0))
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         x = torch.cat([posterior, deterministic], dim=-1)
@@ -465,6 +506,8 @@ class RecurrentModel(nn.Module):
         self.recurrent = LayerNormGRUCell(
             512, args.deterministic_size, bias=False, layer_norm_cls=nn.LayerNorm, layer_norm_kw={"eps": 1e-3}
         )
+        self.mlp.apply(init_weights)
+        self.recurrent.apply(init_weights)
 
     def forward(self, state: Tensor, action: Tensor, deterministic: Tensor) -> Tensor:
         x = torch.cat([state, action], dim=1)
@@ -490,6 +533,8 @@ class TransitionModel(nn.Module):
             nn.SiLU(),
             nn.Linear(512, args.stochastic_size),
         )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(1.0))
 
     def forward(self, deterministic: Tensor) -> tuple[Distribution, Tensor]:
         logits = self.net(deterministic).view(-1, args.stochastic_length, args.stochastic_classes)
@@ -507,6 +552,8 @@ class RepresentationModel(nn.Module):
             nn.SiLU(),
             nn.Linear(512, args.stochastic_size),
         )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(1.0))
 
     def forward(self, embedded_obs: Tensor, deterministic: Tensor) -> tuple[Distribution, Tensor]:
         x = torch.cat([embedded_obs, deterministic], dim=1)
@@ -528,6 +575,8 @@ class RewardPredictor(nn.Module):
             nn.SiLU(),
             nn.Linear(512, args.bins),
         )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(0.0))
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         input_shape = posterior.shape
@@ -551,6 +600,8 @@ class Actor(nn.Module):
             nn.SiLU(),
             nn.Linear(512, envs.single_action_space.shape[0] * 2),
         )
+        [m.apply(init_weights) for m in self.actor[:-1]]
+        self.actor[-1].apply(uniform_init_weights(1.0))
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         x = torch.cat([posterior, deterministic], dim=-1)
@@ -566,20 +617,21 @@ class Critic(nn.Module):
     def __init__(self):
         super().__init__()
         self.critic = nn.Sequential(
-            nn.Linear(args.stochastic_size + args.deterministic_size, 400),
-            nn.ELU(),
-            nn.Linear(400, 400),
-            nn.ELU(),
-            nn.Linear(400, 1),
+            nn.Linear(args.stochastic_size + args.deterministic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.bins),
         )
-        self.critic.apply(initialize_weights)
+        [m.apply(init_weights) for m in self.critic[:-1]]
+        self.critic[-1].apply(uniform_init_weights(0.0))
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         x = torch.cat([posterior, deterministic], dim=-1)
-        mean = self.critic(x)
-        std = 1  # XXX: why std is 1?
-        dist = Independent(Normal(mean, std), 1)
-        return dist
+        predicted_value_bins = self.critic(x)
+        return predicted_value_bins
 
 
 ########################################################
@@ -727,19 +779,27 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     deterministics = torch.stack(deterministics, dim=1)
 
     predicted_rewards = TwoHotEncodingDistribution(reward_predictor(states, deterministics), dims=1).mean
-    values = critic(states, deterministics).mean
-    continues = torch.ones_like(values) * 0.99
-    lambda_values = compute_lambda_values(predicted_rewards, values, continues, args.horizon, device, args.gae_lambda)
+    predicted_values = TwoHotEncodingDistribution(critic(states, deterministics), dims=1).mean
+
+    continues = torch.ones_like(predicted_values) * 0.99
+    lambda_values = compute_lambda_values(
+        predicted_rewards, predicted_values, continues, args.horizon, device, args.gae_lambda
+    )
 
     # directly compute the gradient since the "dreamed environment" is differentiable
-    actor_loss = -lambda_values.mean()
+    # TODO: implement normalization
+    # TODO: implement discounting
+    # TODO: implement entropy loss
+    actor_loss = -(lambda_values - predicted_values[:, :-1]).mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     nn.utils.clip_grad_norm_(actor.parameters(), 100)
     actor_optimizer.step()
 
-    value_dist = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
-    value_loss = -value_dist.log_prob(lambda_values.detach()).mean()
+    # TODO: implement second critic
+    predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
+    predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
+    value_loss = -predicted_value_dist.log_prob(lambda_values.detach()).mean()
     critic_optimizer.zero_grad()
     value_loss.backward()
     nn.utils.clip_grad_norm_(critic.parameters(), 100)
