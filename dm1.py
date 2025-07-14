@@ -16,7 +16,6 @@ from typing import Sequence
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic run
 
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,70 +27,9 @@ from torch import Tensor
 from torch.distributions import Distribution, Independent, Normal, TanhTransform, TransformedDistribution, kl_divergence
 from torch.utils.tensorboard.writer import SummaryWriter
 
+from src.envs.env_factory import create_vector_env
+
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
-
-
-########################################################
-## Experimental
-########################################################
-from dm_control import suite
-from gymnasium import spaces
-
-from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
-
-
-class DMCWrapper:
-    def __init__(self, env_id: str, seed: int, width: int = 64, height: int = 64, decimation: int = 1):
-        domain_name = env_id.split("-")[0]
-        task_name = env_id.split("-")[1]
-        self.env = suite.load(domain_name, task_name, task_kwargs={"random": seed})
-        self.width = width
-        self.height = height
-        self.decimation = decimation
-        action_spec = self.env.action_spec()
-        self._action_space = spaces.Box(
-            low=-1, high=1, shape=action_spec.shape, dtype=np.float32
-        )  # XXX: may only work for walker
-
-    def reset(self) -> tuple[np.ndarray, dict]:
-        self.env.reset()
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
-        return obs, {}
-
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
-        reward = 0
-        for _ in range(self.decimation):
-            data = self.env.step(action)
-            reward += data.reward
-            done = data.last()
-            if done:
-                break
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
-        return obs, reward, done, done, {}
-
-    def render(self):
-        raise NotImplementedError
-
-    def close(self):
-        pass
-
-    @property
-    def observation_space(self):
-        return spaces.Box(low=-0.5, high=0.5, shape=(3, self.width, self.height), dtype=np.float32)
-
-    @property
-    def action_space(self):
-        return self._action_space
-
-    @property
-    def metadata(self):
-        return {}
-
-    @property
-    def episode_length(self) -> int:
-        return int(self.env._step_limit / self.decimation)
 
 
 ########################################################
@@ -434,10 +372,7 @@ enable_deterministic_run()
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
 
-envs = gym.vector.SyncVectorEnv([
-    lambda: DMCWrapper(args.env_id.removeprefix("dm_control/"), args.seed, decimation=2) for _ in range(args.num_envs)
-])
-envs = NumpyToTorch(envs, device=device)
+envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2, image_size=(64, 64))
 writer = SummaryWriter(f"logdir/{run_name}")
 writer.add_text(
     "hyperparameters",
