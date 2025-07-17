@@ -351,6 +351,13 @@ class TwoHotEncodingDistribution:
         return (target * log_pred).sum(dim=self.dims)
 
 
+class SafeBernoulli(Bernoulli):
+    @property
+    def mode(self) -> Tensor:
+        mode = (self.probs >= 0.5).to(self.probs)
+        return mode
+
+
 ########################################################
 ## Args
 ########################################################
@@ -763,7 +770,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     reward_loss = -predicted_reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
     predicted_continue = continue_model(posteriors, deterministics)
-    predicted_continue_dist = Bernoulli(logits=predicted_continue)
+    predicted_continue_dist = SafeBernoulli(logits=predicted_continue)
     true_continue = 1 - data["done"][:, 1:]
     continue_loss = -predicted_continue_dist.log_prob(true_continue).mean()
 
@@ -811,7 +818,8 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     predicted_rewards = TwoHotEncodingDistribution(reward_predictor(states, deterministics), dims=1).mean
     predicted_values = TwoHotEncodingDistribution(critic(states, deterministics), dims=1).mean
 
-    continues = torch.ones_like(predicted_values) * 0.99
+    continues_logits = continue_model(states, deterministics)
+    continues = SafeBernoulli(logits=continues_logits).mode * 0.997
     lambda_values = compute_lambda_values(
         predicted_rewards, predicted_values, continues, args.horizon, device, args.gae_lambda
     )
