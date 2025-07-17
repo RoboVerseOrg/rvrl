@@ -608,6 +608,8 @@ class ContinueModel(nn.Module):
             nn.SiLU(),
             nn.Linear(512, 1),
         )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(1.0))
 
     def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         input_shape = posterior.shape
