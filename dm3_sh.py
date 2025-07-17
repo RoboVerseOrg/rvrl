@@ -358,6 +358,32 @@ class SafeBernoulli(Bernoulli):
         return mode
 
 
+class Moments(nn.Module):
+    """
+    Copied from https://github.com/Eclectic-Sheep/sheeprl/blob/419c7ce05b67b0fd89b62ae0b73b71b3f7a96514/sheeprl/algos/dreamer_v3/utils.py#L40
+    """
+
+    def __init__(
+        self, decay: float = 0.99, max_: float = 1.0, percentile_low: float = 0.05, percentile_high: float = 0.95
+    ) -> None:
+        super().__init__()
+        self._decay = decay
+        self._max = torch.tensor(max_)
+        self._percentile_low = percentile_low
+        self._percentile_high = percentile_high
+        self.register_buffer("low", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("high", torch.zeros((), dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Any:
+        low = torch.quantile(x, self._percentile_low)
+        high = torch.quantile(x, self._percentile_high)
+        with torch.no_grad():  # ! stop tracing gradient, otherwise will cause memory leak
+            self.low = self._decay * self.low + (1 - self._decay) * low
+            self.high = self._decay * self.high + (1 - self._decay) * high
+        invscale = torch.max(1 / self._max, self.high - self.low)
+        return self.low.detach(), invscale.detach()
+
+
 ########################################################
 ## Args
 ########################################################
@@ -696,6 +722,7 @@ reward_predictor = RewardPredictor().to(device)
 continue_model = ContinueModel().to(device)
 actor = Actor(envs).to(device)
 critic = Critic().to(device)
+moments = Moments().to(device)
 model_params = chain(
     encoder.parameters(),
     decoder.parameters(),
@@ -822,15 +849,23 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
 
     continues_logits = continue_model(states, deterministics)
     continues = SafeBernoulli(logits=continues_logits).mode * 0.997
+
     lambda_values = compute_lambda_values(
         predicted_rewards, predicted_values, continues, args.horizon, device, args.gae_lambda
     )
 
+    ## Normalize return, Eq. 7 in the paper
+    baselines = predicted_values[:, :-1]
+    offset, invscale = moments(lambda_values)
+    normalized_lambda_values = (lambda_values - offset) * invscale
+    normalized_baselines = (baselines - offset) * invscale
+
+    advantages = normalized_lambda_values - normalized_baselines
+
     # directly compute the gradient since the "dreamed environment" is differentiable
-    # TODO: implement normalization
     # TODO: implement discounting
     # TODO: implement entropy loss
-    actor_loss = -(lambda_values - predicted_values[:, :-1]).mean()
+    actor_loss = -advantages.mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     nn.utils.clip_grad_norm_(actor.parameters(), 100)
