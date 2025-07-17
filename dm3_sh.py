@@ -25,6 +25,7 @@ from loguru import logger as log
 from rich.logging import RichHandler
 from torch import Tensor
 from torch.distributions import (
+    Bernoulli,
     Distribution,
     Independent,
     Normal,
@@ -588,6 +589,28 @@ class RewardPredictor(nn.Module):
         return predicted_reward_bins
 
 
+class ContinueModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(args.deterministic_size + args.stochastic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 1),
+        )
+
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
+        input_shape = posterior.shape
+        posterior = posterior.flatten(0, 1)
+        deterministic = deterministic.flatten(0, 1)
+        x = torch.cat([posterior, deterministic], dim=1)
+        logits = self.net(x)
+        return logits.unflatten(0, input_shape[:2])
+
+
 class Actor(nn.Module):
     def __init__(self, envs):
         super().__init__()
@@ -661,6 +684,7 @@ recurrent_model = RecurrentModel(envs).to(device)
 transition_model = TransitionModel().to(device)
 representation_model = RepresentationModel().to(device)
 reward_predictor = RewardPredictor().to(device)
+continue_model = ContinueModel().to(device)
 actor = Actor(envs).to(device)
 critic = Critic().to(device)
 model_params = chain(
@@ -670,6 +694,7 @@ model_params = chain(
     transition_model.parameters(),
     representation_model.parameters(),
     reward_predictor.parameters(),
+    continue_model.parameters(),
 )
 model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=1e-8)
 actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=1e-5)
@@ -737,6 +762,11 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     predicted_reward_dist = TwoHotEncodingDistribution(predicted_reward_bins, dims=1)
     reward_loss = -predicted_reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
+    predicted_continue = continue_model(posteriors, deterministics)
+    predicted_continue_dist = Bernoulli(logits=predicted_continue)
+    true_continue = 1 - data["done"][:, 1:]
+    continue_loss = -predicted_continue_dist.log_prob(true_continue).mean()
+
     # KL balancing
     kl_loss1 = kl_divergence(
         Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
@@ -751,7 +781,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
 
     ## TODO: add coefficients for loss terms
-    model_loss = reconstructed_obs_loss + reward_loss + kl_loss
+    model_loss = reconstructed_obs_loss + reward_loss + continue_loss + kl_loss
 
     model_optimizer.zero_grad()
     model_loss.backward()
