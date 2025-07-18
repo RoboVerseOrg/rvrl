@@ -7,7 +7,6 @@ except ImportError:
 
 import os
 import random
-import time
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
@@ -34,6 +33,7 @@ from torch.distributions import (
 )
 from torch.distributions.utils import probs_to_logits
 from torch.utils.tensorboard.writer import SummaryWriter
+from tqdm.rich import trange
 
 from src.envs.env_factory import create_vector_env
 
@@ -410,6 +410,7 @@ class Args:
     debug: bool = False
     train_per_rollout: int = 100
     bins = 256  # y
+    total_steps: int = 500000
 
     @property
     def stochastic_size(self):
@@ -738,32 +739,6 @@ critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=
 cnt_episode = 0
 
 
-@torch.inference_mode()
-def rollout(envs, rounds: int):
-    global cnt_episode
-    for _ in range(rounds):
-        posterior = torch.zeros(args.num_envs, args.stochastic_size, device=device)
-        deterministic = torch.zeros(args.num_envs, args.deterministic_size, device=device)
-        action = torch.zeros(args.num_envs, envs.single_action_space.shape[0], device=device)
-        obs, _ = envs.reset()
-        reward_sum = torch.zeros(envs.num_envs, device=device)
-        while True:
-            embeded_obs = encoder(obs)
-            deterministic = recurrent_model(posterior, action, deterministic)
-            _, posterior = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
-            action = actor(posterior, deterministic).sample()
-            next_obs, reward, terminated, truncated, info = envs.step(action)
-            reward_sum += reward
-            done = torch.logical_or(terminated, truncated)
-            buffer.add(obs, action, reward, next_obs, done)
-            obs = next_obs
-            if done.all():
-                break
-        cnt_episode += args.num_envs
-        print(f"Episode {cnt_episode}, Return: {reward_sum.mean().item()}")
-        writer.add_scalar("charts/episodic_return", reward_sum.mean().item(), cnt_episode)
-
-
 def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
     deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
@@ -882,27 +857,32 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
 
 
 def main():
-    ## rollout before training
-    tic = time.time()
-    rollout(envs, args.prefill // args.num_envs)
-    toc = time.time()
-    log.info(f"Time taken for pre-rollout: {toc - tic:.2f} seconds")
-    log.info(f"Pre-collected buffer size: {len(buffer)}")
+    posterior = torch.zeros(args.num_envs, args.stochastic_size, device=device)
+    deterministic = torch.zeros(args.num_envs, args.deterministic_size, device=device)
+    action = torch.zeros(args.num_envs, envs.single_action_space.shape[0], device=device)
 
-    ## training loop
-    for iteration in range(args.num_iterations):
-        tic = time.time()
-        for sample_index in range(args.train_per_rollout):
-            data = buffer.sample(args.batch_size, args.batch_length)
-            posteriors, deterministics = dynamic_learning(data)
-            behavior_learning(posteriors, deterministics)
-        toc = time.time()
-        log.info(f"Time taken for training iteration {iteration}: {toc - tic:.2f} seconds")
+    obs, _ = envs.reset()
+    for global_step in trange(0, args.total_steps, args.num_envs):
+        ## Step the environment and add to buffer
+        with torch.inference_mode():
+            embeded_obs = encoder(obs)
+            deterministic = recurrent_model(posterior, action, deterministic)
+            _, posterior = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
+            if global_step < args.prefill:
+                action = torch.as_tensor(envs.action_space.sample(), device=device)
+            else:
+                action = actor(posterior, deterministic).sample()
+            next_obs, reward, terminated, truncated, info = envs.step(action)
+            done = torch.logical_or(terminated, truncated)
+            buffer.add(obs, action, reward, next_obs, done)
 
-        tic = time.time()
-        rollout(envs, 1)
-        toc = time.time()
-        log.info(f"Time taken for rollout: {toc - tic:.2f} seconds")
+        ## Update the model
+        if global_step >= args.prefill:
+            gradient_steps = (global_step - args.prefill) // 2
+            for _ in range(gradient_steps):
+                data = buffer.sample(args.batch_size, args.batch_length)
+                posteriors, deterministics = dynamic_learning(data)
+                behavior_learning(posteriors, deterministics)
 
 
 if __name__ == "__main__":
