@@ -935,6 +935,12 @@ aggregator = MetricAggregator({
     "loss/model_loss": MeanMetric(sync_on_compute=False),
     "loss/actor_loss": MeanMetric(sync_on_compute=False),
     "loss/value_loss": MeanMetric(sync_on_compute=False),
+    "state/kl": MeanMetric(sync_on_compute=False),
+    "state/prior_entropy": MeanMetric(sync_on_compute=False),
+    "state/posterior_entropy": MeanMetric(sync_on_compute=False),
+    "grad_norm/model": MeanMetric(sync_on_compute=False),
+    "grad_norm/actor": MeanMetric(sync_on_compute=False),
+    "grad_norm/critic": MeanMetric(sync_on_compute=False),
 })
 
 
@@ -979,7 +985,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     continue_loss = -predicted_continue_dist.log_prob(true_continue).mean()
 
     # KL balancing, Eq. 3 in the paper
-    kl_loss1 = kl_divergence(
+    kl = kl_loss1 = kl_divergence(
         Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
         Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1),
     )
@@ -996,14 +1002,19 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
 
     model_optimizer.zero_grad()
     model_loss.backward()
-    nn.utils.clip_grad_norm_(model_params, 1000)
+    model_grad_norm = nn.utils.clip_grad_norm_(model_params, 1000)
     model_optimizer.step()
 
-    aggregator.update("loss/reconstruction_loss", reconstructed_obs_loss.item())
-    aggregator.update("loss/reward_loss", reward_loss.item())
-    aggregator.update("loss/continue_loss", continue_loss.item())
-    aggregator.update("loss/kl_loss", kl_loss.item())
-    aggregator.update("loss/model_loss", model_loss.item())
+    with torch.no_grad():
+        aggregator.update("loss/reconstruction_loss", reconstructed_obs_loss.item())
+        aggregator.update("loss/reward_loss", reward_loss.item())
+        aggregator.update("loss/continue_loss", continue_loss.item())
+        aggregator.update("loss/kl_loss", kl_loss.item())
+        aggregator.update("loss/model_loss", model_loss.item())
+        aggregator.update("state/kl", kl.mean().item())
+        aggregator.update("state/prior_entropy", prior_dist.entropy().mean().item())
+        aggregator.update("state/posterior_entropy", posterior_dist.entropy().mean().item())
+        aggregator.update("grad_norm/model", model_grad_norm.mean().item())
 
     return posteriors, deterministics
 
@@ -1050,7 +1061,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     actor_loss = -advantages.mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
-    nn.utils.clip_grad_norm_(actor.parameters(), 100)
+    actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
     actor_optimizer.step()
 
     # TODO: implement second critic
@@ -1059,11 +1070,14 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     value_loss = -predicted_value_dist.log_prob(lambda_values.detach()).mean()
     critic_optimizer.zero_grad()
     value_loss.backward()
-    nn.utils.clip_grad_norm_(critic.parameters(), 100)
+    critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 100)
     critic_optimizer.step()
 
-    aggregator.update("loss/actor_loss", actor_loss.item())
-    aggregator.update("loss/value_loss", value_loss.item())
+    with torch.no_grad():
+        aggregator.update("loss/actor_loss", actor_loss.item())
+        aggregator.update("loss/value_loss", value_loss.item())
+        aggregator.update("grad_norm/actor", actor_grad_norm.mean().item())
+        aggregator.update("grad_norm/critic", critic_grad_norm.mean().item())
 
 
 def main():
