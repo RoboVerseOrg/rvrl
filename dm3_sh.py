@@ -74,6 +74,7 @@ class ReplayBuffer:
         self.action = np.empty((self.capacity, action_size), dtype=np.float32)
         self.reward = np.empty((self.capacity, 1), dtype=np.float32)
         self.done = np.empty((self.capacity, 1), dtype=np.float32)
+        self.terminated = np.empty((self.capacity, 1), dtype=np.float32)
 
         self.buffer_index = 0
         self.full = False
@@ -81,7 +82,15 @@ class ReplayBuffer:
     def __len__(self):
         return self.capacity if self.full else self.buffer_index
 
-    def add(self, observation: Tensor, action: Tensor, reward: Tensor, next_observation: Tensor, done: Tensor):
+    def add(
+        self,
+        observation: Tensor,
+        action: Tensor,
+        reward: Tensor,
+        next_observation: Tensor,
+        done: Tensor,
+        terminated: Tensor,
+    ):
         B = observation.shape[0]
         indices = (self.buffer_index + np.arange(B)) % self.capacity
         self.observation[indices] = observation.detach().cpu().numpy()
@@ -89,6 +98,7 @@ class ReplayBuffer:
         self.reward[indices] = reward.unsqueeze(-1).detach().cpu().numpy()
         self.next_observation[indices] = next_observation.detach().cpu().numpy()
         self.done[indices] = done.unsqueeze(-1).detach().cpu().numpy()
+        self.terminated[indices] = terminated.unsqueeze(-1).detach().cpu().numpy()
 
         self.full = self.full or self.buffer_index + B >= self.capacity
         self.buffer_index = (self.buffer_index + B) % self.capacity
@@ -112,6 +122,7 @@ class ReplayBuffer:
         action = torch.as_tensor(self.action[sample_index], device=self.device)
         reward = torch.as_tensor(self.reward[sample_index], device=self.device)
         done = torch.as_tensor(self.done[sample_index], device=self.device)
+        terminated = torch.as_tensor(self.terminated[sample_index], device=self.device)
 
         sample = {
             "observation": observation,
@@ -119,6 +130,7 @@ class ReplayBuffer:
             "reward": reward,
             "next_observation": next_observation,
             "done": done,
+            "terminated": terminated,
         }
         return sample
 
@@ -962,7 +974,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
 
     predicted_continue = continue_model(posteriors, deterministics)
     predicted_continue_dist = SafeBernoulli(logits=predicted_continue)
-    true_continue = 1 - data["done"][:, 1:]
+    true_continue = 1 - data["terminated"][:, 1:]
     continue_loss = -predicted_continue_dist.log_prob(true_continue).mean()
 
     # KL balancing, Eq. 3 in the paper
@@ -1074,7 +1086,8 @@ def main():
                 action = actor(posterior, deterministic).sample()
             next_obs, reward, terminated, truncated, info = envs.step(action)
             done = torch.logical_or(terminated, truncated)
-            buffer.add(obs, action, reward, next_obs, done)
+            buffer.add(obs, action, reward, next_obs, done, terminated)
+            obs = next_obs
 
             episodic_return += reward
             if done.any():

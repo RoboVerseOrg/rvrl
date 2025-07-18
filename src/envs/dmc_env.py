@@ -75,8 +75,10 @@ class DMControlProprioEnv(gym.Env):
             done = timestep.last()
             if done:
                 break
+        truncated = timestep.last() and timestep.discount == 1.0
+        terminated = timestep.last() and timestep.discount == 0.0
         obs = timestep.observation
-        return obs, reward, done, done, {}
+        return obs, reward, terminated, truncated, {}
 
     def render(self):
         raise NotImplementedError
@@ -107,14 +109,16 @@ class DMControlRgbEnv(gym.Env):
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         reward = 0
         for _ in range(self.action_repeat):
-            data = self.env.step(action)
-            reward += data.reward
-            done = data.last()
+            timestep = self.env.step(action)
+            reward += timestep.reward
+            done = timestep.last()
             if done:
                 break
+        truncated = timestep.last() and timestep.discount == 1.0
+        terminated = timestep.last() and timestep.discount == 0.0
         obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
         obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
-        return obs, reward, done, done, {}
+        return obs, reward, terminated, truncated, {}
 
     def render(self):
         raise NotImplementedError
