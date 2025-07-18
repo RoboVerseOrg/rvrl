@@ -154,6 +154,17 @@ def compute_lambda_values(
     Returns:
         Tensor: (batch_size, horizon_length-1) - lambda returns (R_t^λ)
     """
+    # Given the following diagram, with horizon_length=3
+    # Actions:            a'0      a'1      a'2     a'3
+    #                     ^ \      ^ \      ^ \     ^
+    #                    /   \    /   \    /   \   /
+    #                   /     \  /     \  /     \ /
+    # States:         z0  ->  z'1  ->  z'2  ->  z'3
+    # Values:         v'0    [v'1]    [v'2]    [v'3]      <-- input
+    # Rewards:       [r'0]   [r'1]    [r'2]     r'3       <-- input
+    # Continues:     [c'0]   [c'1]    [c'2]     c'3       <-- input
+    # Lambda-values: [l'0]   [l'1]    [l'2]     l'3       <-- output
+
     # Remove last timestep since we need t+1 values
     rewards = rewards[:, :-1]
     continues = continues[:, :-1]
@@ -593,6 +604,7 @@ class Args:
     embedded_obs_size: int = 4096  # y = 256 * 4 * 4
     horizon: int = 15
     gae_lambda: float = 0.95
+    gamma: float = 0.997
     prefill: int = 1000
     debug: bool = False
     train_per_rollout: int = 100
@@ -1042,10 +1054,9 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     predicted_values = TwoHotEncodingDistribution(critic(states, deterministics), dims=1).mean
 
     continues_logits = continue_model(states, deterministics)
-    continues = SafeBernoulli(logits=continues_logits).mode * 0.997
-
+    continues = SafeBernoulli(logits=continues_logits).mode
     lambda_values = compute_lambda_values(
-        predicted_rewards, predicted_values, continues, args.horizon, device, args.gae_lambda
+        predicted_rewards, predicted_values, continues * args.gamma, args.horizon, device, args.gae_lambda
     )
 
     ## Normalize return, Eq. 7 in the paper
@@ -1056,10 +1067,13 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
 
     advantages = normalized_lambda_values - normalized_baselines
 
-    # directly compute the gradient since the "dreamed environment" is differentiable
-    # TODO: implement discounting
+    with torch.no_grad():
+        discount = torch.cumprod(continues[:, :-1] * args.gamma, dim=1) / args.gamma
+
     actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
-    actor_loss = -(advantages + 0.0003 * actor_entropy).mean()
+    # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
+    # For discount factor, see https://ai.stackexchange.com/q/7680
+    actor_loss = -((advantages + 0.0003 * actor_entropy) * discount).mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
@@ -1068,7 +1082,8 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     # TODO: implement second critic
     predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
     predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
-    value_loss = -predicted_value_dist.log_prob(lambda_values.detach()).mean()
+    value_loss = -predicted_value_dist.log_prob(lambda_values.detach())
+    value_loss = (value_loss * discount.squeeze(-1)).mean()
     critic_optimizer.zero_grad()
     value_loss.backward()
     critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 100)
