@@ -951,10 +951,11 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
         prior_dist, prior_logits = transition_model(deterministic)
         posterior_dist, posterior_logits = representation_model(embeded_obs[:, t], deterministic)
+        posterior = posterior_dist.rsample().view(-1, args.stochastic_size)
 
         deterministics.append(deterministic)
         priors_logits.append(prior_logits)
-        posteriors.append(posterior_dist.rsample().view(-1, args.stochastic_size))
+        posteriors.append(posterior)
         posteriors_logits.append(posterior_logits)
 
     deterministics = torch.stack(deterministics, dim=1).to(device)
