@@ -1017,7 +1017,8 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     for t in range(args.horizon):
         action = actor(state, deterministic).rsample()
         deterministic = recurrent_model(state, action, deterministic)
-        _, state = transition_model(deterministic)
+        state_dist, state_logits = transition_model(deterministic)
+        state = state_dist.rsample().view(-1, args.stochastic_size)
         states.append(state)
         deterministics.append(deterministic)
 
@@ -1079,7 +1080,8 @@ def main():
         with torch.inference_mode():
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
-            _, posterior = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
+            posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
+            posterior = posterior_dist.sample().view(-1, args.stochastic_size)
             if global_step < args.prefill:
                 action = torch.as_tensor(envs.action_space.sample(), device=device)
             else:
