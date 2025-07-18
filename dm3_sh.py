@@ -938,6 +938,7 @@ aggregator = MetricAggregator({
     "state/kl": MeanMetric(sync_on_compute=False),
     "state/prior_entropy": MeanMetric(sync_on_compute=False),
     "state/posterior_entropy": MeanMetric(sync_on_compute=False),
+    "state/actor_entropy": MeanMetric(sync_on_compute=False),
     "grad_norm/model": MeanMetric(sync_on_compute=False),
     "grad_norm/actor": MeanMetric(sync_on_compute=False),
     "grad_norm/critic": MeanMetric(sync_on_compute=False),
@@ -1057,8 +1058,8 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
 
     # directly compute the gradient since the "dreamed environment" is differentiable
     # TODO: implement discounting
-    # TODO: implement entropy loss
-    actor_loss = -advantages.mean()
+    actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
+    actor_loss = -(advantages + 0.0003 * actor_entropy).mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
@@ -1076,6 +1077,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     with torch.no_grad():
         aggregator.update("loss/actor_loss", actor_loss.item())
         aggregator.update("loss/value_loss", value_loss.item())
+        aggregator.update("state/actor_entropy", actor_entropy.mean().item())
         aggregator.update("grad_norm/actor", actor_grad_norm.mean().item())
         aggregator.update("grad_norm/critic", critic_grad_norm.mean().item())
 
