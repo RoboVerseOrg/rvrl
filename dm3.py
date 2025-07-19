@@ -35,10 +35,10 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from torchmetrics import MeanMetric
 from tqdm.rich import tqdm_rich as tqdm
 
-from src.envs.env_factory import create_vector_env
-from src.utils.metrics import MetricAggregator
-from src.utils.reproducibility import enable_deterministic_run, seed_everything
-from src.utils.utils import Ratio
+from rvrl.envs.env_factory import create_vector_env
+from rvrl.utils.metrics import MetricAggregator
+from rvrl.utils.reproducibility import enable_deterministic_run, seed_everything
+from rvrl.utils.utils import Ratio
 
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 

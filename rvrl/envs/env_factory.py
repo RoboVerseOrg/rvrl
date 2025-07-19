@@ -6,8 +6,8 @@ from typing import Literal
 
 import gymnasium as gym
 
-from src.envs import BaseVecEnv
-from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
+from rvrl.envs import BaseVecEnv
+from rvrl.wrapper.numpy_to_torch_wrapper import NumpyToTorch
 
 SEED_SPACING = 1_000_000
 

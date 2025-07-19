@@ -27,7 +27,7 @@ from torch import Tensor
 from torch.distributions import Distribution, Independent, Normal, TanhTransform, TransformedDistribution, kl_divergence
 from torch.utils.tensorboard.writer import SummaryWriter
 
-from src.envs.env_factory import create_vector_env
+from rvrl.envs.env_factory import create_vector_env
 
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 

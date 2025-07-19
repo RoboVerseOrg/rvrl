@@ -21,7 +21,7 @@ from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from src.envs import create_vector_env
+from rvrl.envs import create_vector_env
 
 
 ########################################################

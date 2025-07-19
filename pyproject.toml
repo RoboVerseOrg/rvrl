@@ -52,7 +52,7 @@ lint.ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"src/envs/isaaclab_env.py" = ["FA"]  # isaaclab only supports Python 3.10
+"rvrl/envs/isaaclab_env.py" = ["FA"]  # isaaclab only supports Python 3.10
 
 [tool.uv]
 index-strategy = "unsafe-first-match"
