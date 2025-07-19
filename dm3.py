@@ -432,6 +432,7 @@ class Args:
     train_per_rollout: int = 100
     bins = 256  # y
     total_steps: int = 500000
+    amp: bool = True
 
     @property
     def stochastic_size(self):
@@ -763,6 +764,10 @@ model_params = chain(
 model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=1e-8)
 actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=1e-5)
 critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=1e-5)
+model_scaler = torch.amp.GradScaler(enabled=args.amp)
+actor_scaler = torch.amp.GradScaler(enabled=args.amp)
+critic_scaler = torch.amp.GradScaler(enabled=args.amp)
+
 
 ## logging
 global_step = 0
@@ -788,64 +793,67 @@ aggregator = MetricAggregator({
 def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     # TODO: utilize "next_observation" to update the model
     # TODO: since the replay buffer may contain termination/truncation in the middle of a rollout, we need to handle this case by resetting posterior, deterministic, and action to initial state (zero)
-    posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
-    deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
-    embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
+    with torch.autocast("cuda", enabled=args.amp):
+        posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
+        deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
+        embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
 
-    deterministics = []
-    priors_logits = []
-    posteriors = []
-    posteriors_logits = []
-    for t in range(1, args.batch_length):
-        deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
-        prior_dist, prior_logits = transition_model(deterministic)
-        posterior_dist, posterior_logits = representation_model(embeded_obs[:, t], deterministic)
-        posterior = posterior_dist.rsample().view(-1, args.stochastic_size)
+        deterministics = []
+        priors_logits = []
+        posteriors = []
+        posteriors_logits = []
+        for t in range(1, args.batch_length):
+            deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
+            prior_dist, prior_logits = transition_model(deterministic)
+            posterior_dist, posterior_logits = representation_model(embeded_obs[:, t], deterministic)
+            posterior = posterior_dist.rsample().view(-1, args.stochastic_size)
 
-        deterministics.append(deterministic)
-        priors_logits.append(prior_logits)
-        posteriors.append(posterior)
-        posteriors_logits.append(posterior_logits)
+            deterministics.append(deterministic)
+            priors_logits.append(prior_logits)
+            posteriors.append(posterior)
+            posteriors_logits.append(posterior_logits)
 
-    deterministics = torch.stack(deterministics, dim=1).to(device)
-    prior_logits = torch.stack(priors_logits, dim=1).to(device)
-    posteriors = torch.stack(posteriors, dim=1).to(device)
-    posteriors_logits = torch.stack(posteriors_logits, dim=1).to(device)
+        deterministics = torch.stack(deterministics, dim=1).to(device)
+        prior_logits = torch.stack(priors_logits, dim=1).to(device)
+        posteriors = torch.stack(posteriors, dim=1).to(device)
+        posteriors_logits = torch.stack(posteriors_logits, dim=1).to(device)
 
-    reconstructed_obs = decoder(posteriors, deterministics)
-    reconstructed_obs_dist = MSEDistribution(
-        reconstructed_obs, 3
-    )  # 3 is number of dimensions for observation space, shape is (3, H, W)
-    reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
+        reconstructed_obs = decoder(posteriors, deterministics)
+        reconstructed_obs_dist = MSEDistribution(
+            reconstructed_obs, 3
+        )  # 3 is number of dimensions for observation space, shape is (3, H, W)
+        reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
 
-    predicted_reward_bins = reward_predictor(posteriors, deterministics)
-    predicted_reward_dist = TwoHotEncodingDistribution(predicted_reward_bins, dims=1)
-    reward_loss = -predicted_reward_dist.log_prob(data["reward"][:, 1:]).mean()
+        predicted_reward_bins = reward_predictor(posteriors, deterministics)
+        predicted_reward_dist = TwoHotEncodingDistribution(predicted_reward_bins, dims=1)
+        reward_loss = -predicted_reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
-    predicted_continue = continue_model(posteriors, deterministics)
-    predicted_continue_dist = SafeBernoulli(logits=predicted_continue)
-    true_continue = 1 - data["terminated"][:, 1:]
-    continue_loss = -predicted_continue_dist.log_prob(true_continue).mean()
+        predicted_continue = continue_model(posteriors, deterministics)
+        predicted_continue_dist = SafeBernoulli(logits=predicted_continue)
+        true_continue = 1 - data["terminated"][:, 1:]
+        continue_loss = -predicted_continue_dist.log_prob(true_continue).mean()
 
-    # KL balancing, Eq. 3 in the paper
-    kl = kl_loss1 = kl_divergence(
-        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
-        Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1),
-    )
-    kl_loss1 = torch.max(kl_loss1, torch.tensor(1.0, device=device))
-    kl_loss2 = kl_divergence(
-        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1),
-        Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
-    )
-    kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
-    kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
+        # KL balancing, Eq. 3 in the paper
+        kl = kl_loss1 = kl_divergence(
+            Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
+            Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1),
+        )
+        kl_loss1 = torch.max(kl_loss1, torch.tensor(1.0, device=device))
+        kl_loss2 = kl_divergence(
+            Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1),
+            Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
+        )
+        kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
+        kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
 
-    model_loss = reconstructed_obs_loss + reward_loss + continue_loss + kl_loss
+        model_loss = reconstructed_obs_loss + reward_loss + continue_loss + kl_loss
 
     model_optimizer.zero_grad()
-    model_loss.backward()
+    model_scaler.scale(model_loss).backward()
+    model_scaler.unscale_(model_optimizer)
     model_grad_norm = nn.utils.clip_grad_norm_(model_params, 1000)
-    model_optimizer.step()
+    model_scaler.step(model_optimizer)
+    model_scaler.update()
 
     with torch.no_grad():
         aggregator.update("loss/reconstruction_loss", reconstructed_obs_loss.item())
@@ -866,58 +874,64 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     state = posteriors_.detach().view(-1, args.stochastic_size)
     deterministic = deterministics_.detach().view(-1, args.deterministic_size)
 
-    states = []
-    deterministics = []
-    for t in range(args.horizon):
-        action = actor(state, deterministic).rsample()
-        deterministic = recurrent_model(state, action, deterministic)
-        state_dist, state_logits = transition_model(deterministic)
-        state = state_dist.rsample().view(-1, args.stochastic_size)
-        states.append(state)
-        deterministics.append(deterministic)
+    with torch.autocast("cuda", enabled=args.amp):
+        states = []
+        deterministics = []
+        for t in range(args.horizon):
+            action = actor(state, deterministic).rsample()
+            deterministic = recurrent_model(state, action, deterministic)
+            state_dist, state_logits = transition_model(deterministic)
+            state = state_dist.rsample().view(-1, args.stochastic_size)
+            states.append(state)
+            deterministics.append(deterministic)
 
-    states = torch.stack(states, dim=1)
-    deterministics = torch.stack(deterministics, dim=1)
+        states = torch.stack(states, dim=1)
+        deterministics = torch.stack(deterministics, dim=1)
 
-    predicted_rewards = TwoHotEncodingDistribution(reward_predictor(states, deterministics), dims=1).mean
-    predicted_values = TwoHotEncodingDistribution(critic(states, deterministics), dims=1).mean
+        predicted_rewards = TwoHotEncodingDistribution(reward_predictor(states, deterministics), dims=1).mean
+        predicted_values = TwoHotEncodingDistribution(critic(states, deterministics), dims=1).mean
 
-    continues_logits = continue_model(states, deterministics)
-    continues = SafeBernoulli(logits=continues_logits).mode
-    lambda_values = compute_lambda_values(
-        predicted_rewards, predicted_values, continues * args.gamma, args.horizon, device, args.gae_lambda
-    )
+        continues_logits = continue_model(states, deterministics)
+        continues = SafeBernoulli(logits=continues_logits).mode
+        lambda_values = compute_lambda_values(
+            predicted_rewards, predicted_values, continues * args.gamma, args.horizon, device, args.gae_lambda
+        )
 
-    ## Normalize return, Eq. 7 in the paper
-    baselines = predicted_values[:, :-1]
-    offset, invscale = moments(lambda_values)
-    normalized_lambda_values = (lambda_values - offset) * invscale
-    normalized_baselines = (baselines - offset) * invscale
+        ## Normalize return, Eq. 7 in the paper
+        baselines = predicted_values[:, :-1]
+        offset, invscale = moments(lambda_values)
+        normalized_lambda_values = (lambda_values - offset) * invscale
+        normalized_baselines = (baselines - offset) * invscale
 
-    advantages = normalized_lambda_values - normalized_baselines
+        advantages = normalized_lambda_values - normalized_baselines
 
-    # TODO: what would happen if we don't use discount factor?
-    with torch.no_grad():
-        discount = torch.cumprod(continues[:, :-1] * args.gamma, dim=1) / args.gamma
+        # TODO: what would happen if we don't use discount factor?
+        with torch.no_grad():
+            discount = torch.cumprod(continues[:, :-1] * args.gamma, dim=1) / args.gamma
 
-    actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
-    # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
-    # For discount factor, see https://ai.stackexchange.com/q/7680, though it is for REINFORCE
-    actor_loss = -((advantages + 0.0003 * actor_entropy) * discount).mean()
+        actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
+        # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
+        # For discount factor, see https://ai.stackexchange.com/q/7680, though it is for REINFORCE
+        actor_loss = -((advantages + 0.0003 * actor_entropy) * discount).mean()
     actor_optimizer.zero_grad()
-    actor_loss.backward()
+    actor_scaler.scale(actor_loss).backward()
+    actor_scaler.unscale_(actor_optimizer)
     actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
-    actor_optimizer.step()
+    actor_scaler.step(actor_optimizer)
+    actor_scaler.update()
 
     # TODO: implement target critic
-    predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
-    predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
-    value_loss = -predicted_value_dist.log_prob(lambda_values.detach())
-    value_loss = (value_loss * discount.squeeze(-1)).mean()
+    with torch.autocast("cuda", enabled=args.amp):
+        predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
+        predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
+        value_loss = -predicted_value_dist.log_prob(lambda_values.detach())
+        value_loss = (value_loss * discount.squeeze(-1)).mean()
     critic_optimizer.zero_grad()
-    value_loss.backward()
+    critic_scaler.scale(value_loss).backward()
+    critic_scaler.unscale_(critic_optimizer)
     critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 100)
-    critic_optimizer.step()
+    critic_scaler.step(critic_optimizer)
+    critic_scaler.update()
 
     with torch.no_grad():
         aggregator.update("loss/actor_loss", actor_loss.item())
@@ -940,14 +954,15 @@ def main():
     while global_step < args.total_steps:
         ## Step the environment and add to buffer
         with torch.inference_mode():
-            embeded_obs = encoder(obs)
-            deterministic = recurrent_model(posterior, action, deterministic)
-            posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
-            posterior = posterior_dist.sample().view(-1, args.stochastic_size)
-            if global_step < args.prefill:
-                action = torch.as_tensor(envs.action_space.sample(), device=device)
-            else:
-                action = actor(posterior, deterministic).sample()
+            with torch.autocast("cuda", enabled=args.amp):
+                embeded_obs = encoder(obs)
+                deterministic = recurrent_model(posterior, action, deterministic)
+                posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
+                posterior = posterior_dist.sample().view(-1, args.stochastic_size)
+                if global_step < args.prefill:
+                    action = torch.as_tensor(envs.action_space.sample(), device=device)
+                else:
+                    action = actor(posterior, deterministic).sample()
             next_obs, reward, terminated, truncated, info = envs.step(action)
             done = torch.logical_or(terminated, truncated)
             buffer.add(obs, action, reward, next_obs, done, terminated)
