@@ -5,17 +5,17 @@ try:
 except ImportError:
     pass
 
+import math
 import os
 import random
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
-from typing import Sequence
+from typing import Any, Callable, Sequence
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic run
 
-import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -25,80 +25,21 @@ from loguru import logger as log
 from rich.logging import RichHandler
 from torch import Tensor
 from torch.distributions import (
+    Bernoulli,
     Distribution,
     Independent,
     Normal,
     OneHotCategoricalStraightThrough,
-    TanhTransform,
-    TransformedDistribution,
     kl_divergence,
 )
 from torch.distributions.utils import probs_to_logits
 from torch.utils.tensorboard.writer import SummaryWriter
+from torchmetrics import MeanMetric, Metric
+from tqdm.rich import tqdm_rich as tqdm
+
+from src.envs.env_factory import create_vector_env
 
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
-
-########################################################
-## Experimental
-########################################################
-from dm_control import suite
-from gymnasium import spaces
-
-from src.wrapper.numpy_to_torch_wrapper import NumpyToTorch
-
-
-class DMCWrapper:
-    def __init__(self, env_id: str, seed: int, width: int = 64, height: int = 64, decimation: int = 1):
-        domain_name = env_id.split("-")[0]
-        task_name = env_id.split("-")[1]
-        self.env = suite.load(domain_name, task_name, task_kwargs={"random": seed})
-        self.width = width
-        self.height = height
-        self.decimation = decimation
-        action_spec = self.env.action_spec()
-        self._action_space = spaces.Box(
-            low=-1, high=1, shape=action_spec.shape, dtype=np.float32
-        )  # XXX: may only work for walker
-
-    def reset(self) -> tuple[np.ndarray, dict]:
-        self.env.reset()
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
-        return obs, {}
-
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
-        reward = 0
-        for _ in range(self.decimation):
-            data = self.env.step(action)
-            reward += data.reward
-            done = data.last()
-            if done:
-                break
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
-        return obs, reward, done, done, {}
-
-    def render(self):
-        raise NotImplementedError
-
-    def close(self):
-        pass
-
-    @property
-    def observation_space(self):
-        return spaces.Box(low=-0.5, high=0.5, shape=(3, self.width, self.height), dtype=np.float32)
-
-    @property
-    def action_space(self):
-        return self._action_space
-
-    @property
-    def metadata(self):
-        return {}
-
-    @property
-    def episode_length(self) -> int:
-        return int(self.env._step_limit / self.decimation)
 
 
 ########################################################
@@ -121,15 +62,25 @@ def enable_deterministic_run():
 
 class ReplayBuffer:
     def __init__(
-        self, observation_shape: Sequence[int], action_size: int, device: str | torch.device, capacity: int = 5000000
+        self,
+        observation_shape: Sequence[int],
+        action_size: int,
+        device: str | torch.device,
+        num_envs: int = 1,
+        capacity: int = 5000000,
     ):
         self.device = device
+        self.num_envs = num_envs
         self.capacity = capacity
-        self.observation = np.empty((self.capacity, *observation_shape), dtype=np.float32)
-        self.next_observation = np.empty((self.capacity, *observation_shape), dtype=np.float32)
-        self.action = np.empty((self.capacity, action_size), dtype=np.float32)
-        self.reward = np.empty((self.capacity, 1), dtype=np.float32)
-        self.done = np.empty((self.capacity, 1), dtype=np.float32)
+
+        state_type = np.uint8 if len(observation_shape) < 3 else np.float32
+
+        self.observation = np.empty((self.capacity, self.num_envs, *observation_shape), dtype=state_type)
+        self.next_observation = np.empty((self.capacity, self.num_envs, *observation_shape), dtype=state_type)
+        self.action = np.empty((self.capacity, self.num_envs, action_size), dtype=np.float32)
+        self.reward = np.empty((self.capacity, self.num_envs, 1), dtype=np.float32)
+        self.done = np.empty((self.capacity, self.num_envs, 1), dtype=np.float32)
+        self.terminated = np.empty((self.capacity, self.num_envs, 1), dtype=np.float32)
 
         self.buffer_index = 0
         self.full = False
@@ -137,36 +88,60 @@ class ReplayBuffer:
     def __len__(self):
         return self.capacity if self.full else self.buffer_index
 
-    def add(self, observation: Tensor, action: Tensor, reward: Tensor, next_observation: Tensor, done: Tensor) -> None:
+    def add(
+        self,
+        observation: Tensor,
+        action: Tensor,
+        reward: Tensor,
+        next_observation: Tensor,
+        done: Tensor,
+        terminated: Tensor,
+    ):
         self.observation[self.buffer_index] = observation.detach().cpu().numpy()
         self.action[self.buffer_index] = action.detach().cpu().numpy()
-        self.reward[self.buffer_index] = reward.detach().cpu().numpy()
+        self.reward[self.buffer_index] = reward.unsqueeze(-1).detach().cpu().numpy()
         self.next_observation[self.buffer_index] = next_observation.detach().cpu().numpy()
-        self.done[self.buffer_index] = done.detach().cpu().numpy()
+        self.done[self.buffer_index] = done.unsqueeze(-1).detach().cpu().numpy()
+        self.terminated[self.buffer_index] = terminated.unsqueeze(-1).detach().cpu().numpy()
 
         self.buffer_index = (self.buffer_index + 1) % self.capacity
         self.full = self.full or self.buffer_index == 0
 
     def sample(self, batch_size, chunk_size) -> dict[str, Tensor]:
+        """
+        Sample elements from the replay buffer in a sequential manner, without considering the episode
+        boundaries.
+        """
         last_filled_index = self.buffer_index - chunk_size + 1
         assert self.full or (last_filled_index > batch_size), "too short dataset or too long chunk_size"
-        sample_idx = np.random.randint(0, self.capacity if self.full else last_filled_index, batch_size).reshape(-1, 1)
+        sample_index = np.random.randint(0, self.capacity if self.full else last_filled_index, batch_size).reshape(
+            -1, 1
+        )
         chunk_length = np.arange(chunk_size).reshape(1, -1)
-        sample_idx = (sample_idx + chunk_length) % self.capacity
 
-        observation = torch.as_tensor(self.observation[sample_idx], device=self.device).float()
-        next_observation = torch.as_tensor(self.next_observation[sample_idx], device=self.device).float()
-        action = torch.as_tensor(self.action[sample_idx], device=self.device)
-        reward = torch.as_tensor(self.reward[sample_idx], device=self.device)
-        done = torch.as_tensor(self.done[sample_idx], device=self.device)
+        sample_index = (sample_index + chunk_length) % self.capacity
+        env_index = np.random.randint(0, self.num_envs, batch_size)
+        flattened_index = sample_index * self.num_envs + env_index[:, None]
 
-        return {
+        def flatten(x: np.ndarray) -> np.ndarray:
+            return x.reshape(-1, *x.shape[2:])
+
+        observation = torch.as_tensor(flatten(self.observation)[flattened_index], device=self.device).float()
+        next_observation = torch.as_tensor(flatten(self.next_observation)[flattened_index], device=self.device).float()
+        action = torch.as_tensor(flatten(self.action)[flattened_index], device=self.device)
+        reward = torch.as_tensor(flatten(self.reward)[flattened_index], device=self.device)
+        done = torch.as_tensor(flatten(self.done)[flattened_index], device=self.device)
+        terminated = torch.as_tensor(flatten(self.terminated)[flattened_index], device=self.device)
+
+        sample = {
             "observation": observation,
             "action": action,
             "reward": reward,
             "next_observation": next_observation,
             "done": done,
+            "terminated": terminated,
         }
+        return sample
 
 
 def compute_lambda_values(
@@ -188,6 +163,17 @@ def compute_lambda_values(
     Returns:
         Tensor: (batch_size, horizon_length-1) - lambda returns (R_t^λ)
     """
+    # Given the following diagram, with horizon_length=3
+    # Actions:            a'0      a'1      a'2     a'3
+    #                     ^ \      ^ \      ^ \     ^
+    #                    /   \    /   \    /   \   /
+    #                   /     \  /     \  /     \ /
+    # States:         z0  ->  z'1  ->  z'2  ->  z'3
+    # Values:         v'0    [v'1]    [v'2]    [v'3]      <-- input
+    # Rewards:       [r'0]   [r'1]    [r'2]     r'3       <-- input
+    # Continues:     [c'0]   [c'1]    [c'2]     c'3       <-- input
+    # Lambda-values: [l'0]   [l'1]    [l'2]     l'3       <-- output
+
     # Remove last timestep since we need t+1 values
     rewards = rewards[:, :-1]
     continues = continues[:, :-1]
@@ -211,6 +197,400 @@ def compute_lambda_values(
     return returns
 
 
+class LayerNormChannelLast(nn.LayerNorm):
+    def forward(self, x: Tensor) -> Tensor:
+        x = x.permute(0, 2, 3, 1)
+        x = super().forward(x)
+        x = x.permute(0, 3, 1, 2)
+        return x
+
+
+class MSEDistribution:
+    """
+    Copied from https://github.com/Eclectic-Sheep/sheeprl/blob/33b636681fd8b5340b284f2528db8821ab8dcd0b/sheeprl/utils/distribution.py#L196
+    """
+
+    def __init__(self, mode: Tensor, dims: int, agg: str = "sum"):
+        self._mode = mode
+        self._dims = tuple([-x for x in range(1, dims + 1)])
+        self._agg = agg
+        self._batch_shape = mode.shape[: len(mode.shape) - dims]
+        self._event_shape = mode.shape[len(mode.shape) - dims :]
+
+    @property
+    def mode(self) -> Tensor:
+        return self._mode
+
+    @property
+    def mean(self) -> Tensor:
+        return self._mode
+
+    def log_prob(self, value: Tensor) -> Tensor:
+        assert self._mode.shape == value.shape, (self._mode.shape, value.shape)
+        distance = (self._mode - value) ** 2
+        if self._agg == "mean":
+            loss = distance.mean(self._dims)
+        elif self._agg == "sum":
+            loss = distance.sum(self._dims)
+        else:
+            raise NotImplementedError(self._agg)
+        return -loss
+
+
+class LayerNormGRUCell(nn.Module):
+    """A GRU cell with a LayerNorm
+    copied from https://github.com/Eclectic-Sheep/sheeprl/blob/4441dbf4bcd7ae0daee47d35fb0660bc1fe8bd4b/sheeprl/models/models.py#L331
+    which was taken from https://github.com/danijar/dreamerv2/blob/main/dreamerv2/common/nets.py#L317.
+
+    This particular GRU cell accepts 3-D inputs, with a sequence of length 1, and applies
+    a LayerNorm after the projection of the inputs.
+
+    Args:
+        input_size (int): the input size.
+        hidden_size (int): the hidden state size
+        bias (bool, optional): whether to apply a bias to the input projection.
+            Defaults to True.
+        batch_first (bool, optional): whether the first dimension represent the batch dimension or not.
+            Defaults to False.
+        layer_norm_cls (Callable[..., nn.Module]): the layer norm to apply after the input projection.
+            Defaults to nn.Identiy.
+        layer_norm_kw (Dict[str, Any]): the kwargs of the layer norm.
+            Default to {}.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        batch_first: bool = False,
+        layer_norm_cls: Callable[..., nn.Module] = nn.Identity,
+        layer_norm_kw: dict[str, Any] = {},
+    ) -> None:
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.bias = bias
+        self.batch_first = batch_first
+        self.linear = nn.Linear(input_size + hidden_size, 3 * hidden_size, bias=self.bias)
+        # Avoid multiple values for the `normalized_shape` argument
+        layer_norm_kw.pop("normalized_shape", None)
+        self.layer_norm = layer_norm_cls(3 * hidden_size, **layer_norm_kw)
+
+    def forward(self, input: Tensor, hx: Tensor) -> Tensor:
+        is_3d = input.dim() == 3
+        if is_3d:
+            if input.shape[int(self.batch_first)] == 1:
+                input = input.squeeze(int(self.batch_first))
+            else:
+                raise AssertionError(
+                    "LayerNormGRUCell: Expected input to be 3-D with sequence length equal to 1 but received "
+                    f"a sequence of length {input.shape[int(self.batch_first)]}"
+                )
+        if hx.dim() == 3:
+            hx = hx.squeeze(0)
+        assert input.dim() in (
+            1,
+            2,
+        ), f"LayerNormGRUCell: Expected input to be 1-D or 2-D but received {input.dim()}-D tensor"
+
+        is_batched = input.dim() == 2
+        if not is_batched:
+            input = input.unsqueeze(0)
+
+        hx = hx.unsqueeze(0) if not is_batched else hx
+
+        input = torch.cat((hx, input), -1)
+        x = self.linear(input)
+        x = self.layer_norm(x)
+        reset, cand, update = torch.chunk(x, 3, -1)
+        reset = torch.sigmoid(reset)
+        cand = torch.tanh(reset * cand)
+        update = torch.sigmoid(update - 1)
+        hx = update * cand + (1 - update) * hx
+
+        if not is_batched:
+            hx = hx.squeeze(0)
+        elif is_3d:
+            hx = hx.unsqueeze(0)
+
+        return hx
+
+
+# From https://github.com/danijar/dreamerv3/blob/8fa35f83eee1ce7e10f3dee0b766587d0a713a60/dreamerv3/jaxutils.py
+def symlog(x: Tensor) -> Tensor:
+    return torch.sign(x) * torch.log(1 + torch.abs(x))
+
+
+def symexp(x: Tensor) -> Tensor:
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
+
+class TwoHotEncodingDistribution:
+    """
+    Copied from https://github.com/Eclectic-Sheep/sheeprl/blob/33b636681fd8b5340b284f2528db8821ab8dcd0b/sheeprl/utils/distribution.py#L224
+    """
+
+    def __init__(
+        self,
+        logits: Tensor,
+        dims: int = 0,
+        low: int = -20,
+        high: int = 20,
+        transfwd: Callable[[Tensor], Tensor] = symlog,
+        transbwd: Callable[[Tensor], Tensor] = symexp,
+    ):
+        self.logits = logits
+        self.probs = F.softmax(logits, dim=-1)
+        self.dims = tuple([-x for x in range(1, dims + 1)])
+        self.bins = torch.linspace(low, high, logits.shape[-1], device=logits.device)
+        self.low = low
+        self.high = high
+        self.transfwd = transfwd
+        self.transbwd = transbwd
+        self._batch_shape = logits.shape[: len(logits.shape) - dims]
+        self._event_shape = logits.shape[len(logits.shape) - dims : -1] + (1,)
+
+    @property
+    def mean(self) -> Tensor:
+        return self.transbwd((self.probs * self.bins).sum(dim=self.dims, keepdim=True))
+
+    @property
+    def mode(self) -> Tensor:
+        return self.transbwd((self.probs * self.bins).sum(dim=self.dims, keepdim=True))
+
+    def log_prob(self, x: Tensor) -> Tensor:
+        x = self.transfwd(x)
+        # below in [-1, len(self.bins) - 1]
+        below = (self.bins <= x).type(torch.int32).sum(dim=-1, keepdim=True) - 1
+        # above in [0, len(self.bins)]
+        above = below + 1
+
+        # above in [0, len(self.bins) - 1]
+        above = torch.minimum(above, torch.full_like(above, len(self.bins) - 1))
+        # below in [0, len(self.bins) - 1]
+        below = torch.maximum(below, torch.zeros_like(below))
+
+        equal = below == above
+        dist_to_below = torch.where(equal, 1, torch.abs(self.bins[below] - x))
+        dist_to_above = torch.where(equal, 1, torch.abs(self.bins[above] - x))
+        total = dist_to_below + dist_to_above
+        weight_below = dist_to_above / total
+        weight_above = dist_to_below / total
+        target = (
+            F.one_hot(below, len(self.bins)) * weight_below[..., None]
+            + F.one_hot(above, len(self.bins)) * weight_above[..., None]
+        ).squeeze(-2)
+        log_pred = self.logits - torch.logsumexp(self.logits, dim=-1, keepdim=True)
+        return (target * log_pred).sum(dim=self.dims)
+
+
+class SafeBernoulli(Bernoulli):
+    @property
+    def mode(self) -> Tensor:
+        mode = (self.probs >= 0.5).to(self.probs)
+        return mode
+
+
+class Moments(nn.Module):
+    """
+    Copied from https://github.com/Eclectic-Sheep/sheeprl/blob/419c7ce05b67b0fd89b62ae0b73b71b3f7a96514/sheeprl/algos/dreamer_v3/utils.py#L40
+    """
+
+    def __init__(
+        self, decay: float = 0.99, max_: float = 1.0, percentile_low: float = 0.05, percentile_high: float = 0.95
+    ) -> None:
+        super().__init__()
+        self._decay = decay
+        self._max = torch.tensor(max_)
+        self._percentile_low = percentile_low
+        self._percentile_high = percentile_high
+        self.register_buffer("low", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("high", torch.zeros((), dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Any:
+        low = torch.quantile(x, self._percentile_low)
+        high = torch.quantile(x, self._percentile_high)
+        with torch.no_grad():  # ! stop tracing gradient, otherwise will cause memory leak
+            self.low = self._decay * self.low + (1 - self._decay) * low
+            self.high = self._decay * self.high + (1 - self._decay) * high
+        invscale = torch.max(1 / self._max, self.high - self.low)
+        return self.low.detach(), invscale.detach()
+
+
+class MetricAggregator:
+    """A metric aggregator class to aggregate metrics to be tracked.
+    Args:
+        metrics (Optional[Dict[str, Metric]]): Dict of metrics to aggregate.
+    """
+
+    disabled: bool = False
+
+    def __init__(self, metrics: dict[str, Metric] | None = None, raise_on_missing: bool = False):
+        self.metrics: dict[str, Metric] = {}
+        if metrics is not None:
+            self.metrics = metrics
+        self._raise_on_missing = raise_on_missing
+
+    def __iter__(self):
+        return iter(self.metrics.keys())
+
+    def add(self, name: str, metric: Metric):
+        """Add a metric to the aggregator
+
+        Args:
+            name (str): Name of the metric
+            metric (Metric): Metric to add.
+
+        Raises:
+            MetricAggregatorException: If the metric already exists.
+        """
+        if not self.disabled:
+            if name not in self.metrics:
+                self.metrics.setdefault(name, metric)
+            else:
+                if self._raise_on_missing:
+                    raise ValueError(f"Metric {name} already exists")
+                else:
+                    log.warning(
+                        f"The key '{name}' is already in the metric aggregator. Nothing will be added.", UserWarning
+                    )
+
+    @torch.no_grad()
+    def update(self, name: str, value: Any) -> None:
+        """Update the metric with the value
+
+        Args:
+            name (str): Name of the metric
+            value (Any): Value to update the metric with.
+
+        Raises:
+            ValueError: If the metric does not exist.
+        """
+        if not self.disabled:
+            if name not in self.metrics:
+                if self._raise_on_missing:
+                    raise ValueError(f"Metric {name} does not exist")
+                else:
+                    log.warning(
+                        f"The key '{name}' is missing from the metric aggregator. Nothing will be added.", UserWarning
+                    )
+            else:
+                self.metrics[name].update(value)
+
+    def pop(self, name: str) -> None:
+        """Remove a metric from the aggregator with the given name
+        Args:
+            name (str): Name of the metric
+        """
+        if not self.disabled:
+            if name not in self.metrics:
+                if self._raise_on_missing:
+                    raise ValueError(f"Metric {name} does not exist")
+                else:
+                    log.warning(
+                        f"The key '{name}' is missing from the metric aggregator. Nothing will be popped.", UserWarning
+                    )
+            self.metrics.pop(name, None)
+
+    def reset(self):
+        """Reset all metrics to their initial state"""
+        if not self.disabled:
+            for metric in self.metrics.values():
+                metric.reset()
+
+    def to(self, device: str | torch.device = "cpu") -> MetricAggregator:
+        """Move all metrics to the given device
+        Args:
+            device (str |torch.device, optional): Device to move the metrics to. Defaults to "cpu".
+        """
+        if not self.disabled:
+            if self.metrics:
+                for k, v in self.metrics.items():
+                    self.metrics[k] = v.to(device)
+        return self
+
+    @torch.no_grad()
+    def compute(self) -> dict[str, Any]:
+        """Reduce the metrics to a single value
+        Returns:
+            Reduced metrics
+        """
+        reduced_metrics = {}
+        if not self.disabled:
+            if self.metrics:
+                for k, v in self.metrics.items():
+                    reduced = v.compute()
+                    is_tensor = torch.is_tensor(reduced)
+                    if is_tensor and reduced.numel() == 1:
+                        reduced_metrics[k] = reduced.item()
+                    else:
+                        if not is_tensor:
+                            log.warning(
+                                f"The reduced metric {k} is not a scalar tensor: type={type(reduced)}. "
+                                "This may create problems during the logging phase.",
+                                category=RuntimeWarning,
+                            )
+                        else:
+                            log.warning(
+                                f"The reduced metric {k} is not a scalar: size={v.size()}. "
+                                "This may create problems during the logging phase.",
+                                category=RuntimeWarning,
+                            )
+                        reduced_metrics[k] = reduced
+
+                    is_tensor = torch.is_tensor(reduced_metrics[k])
+                    if (is_tensor and torch.isnan(reduced_metrics[k]).any()) or (
+                        not is_tensor and math.isnan(reduced_metrics[k])
+                    ):
+                        reduced_metrics.pop(k, None)
+        return reduced_metrics
+
+
+class Ratio:
+    """Directly taken from Hafner et al. (2023) implementation:
+    https://github.com/danijar/dreamerv3/blob/8fa35f83eee1ce7e10f3dee0b766587d0a713a60/dreamerv3/embodied/core/when.py#L26
+    """
+
+    def __init__(self, ratio: float, pretrain_steps: int = 0):
+        if pretrain_steps < 0:
+            raise ValueError(f"'pretrain_steps' must be non-negative, got {pretrain_steps}")
+        if ratio < 0:
+            raise ValueError(f"'ratio' must be non-negative, got {ratio}")
+        self._pretrain_steps = pretrain_steps
+        self._ratio = ratio
+        self._prev = None
+
+    def __call__(self, step: int) -> int:
+        if self._ratio == 0:
+            return 0
+        if self._prev is None:
+            self._prev = step
+            repeats = int(step * self._ratio)
+            if self._pretrain_steps > 0:
+                if step < self._pretrain_steps:
+                    log.warning(
+                        "The number of pretrain steps is greater than the number of current steps. This could lead to "
+                        f"a higher ratio than the one specified ({self._ratio}). Setting the 'pretrain_steps' equal to "
+                        "the number of current steps."
+                    )
+                    self._pretrain_steps = step
+                repeats = int(self._pretrain_steps * self._ratio)
+            return repeats
+        repeats = int((step - self._prev) * self._ratio)
+        self._prev += repeats / self._ratio
+        return repeats
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"_ratio": self._ratio, "_prev": self._prev, "_pretrain_steps": self._pretrain_steps}
+
+    def load_state_dict(self, state_dict: dict[str, Any]):
+        self._ratio = state_dict["_ratio"]
+        self._prev = state_dict["_prev"]
+        self._pretrain_steps = state_dict["_pretrain_steps"]
+        return self
+
+
 ########################################################
 ## Args
 ########################################################
@@ -218,25 +598,36 @@ def compute_lambda_values(
 class Args:
     env_id: str = "dm_control/walker-walk-v0"
     exp_name: str = "dreamerv3"
-    num_envs: int = 1
+    num_envs: int = 4
     seed: int = 0
     device: str = "cuda"
-    model_lr: float = 6e-4
-    actor_lr: float = 8e-5
-    critic_lr: float = 8e-5
+    model_lr: float = 1e-4  # y
+    actor_lr: float = 8e-5  # y
+    critic_lr: float = 8e-5  # y
     num_iterations: int = 1000
-    batch_size: int = 50
-    batch_length: int = 50
-    deterministic_size: int = 512
-    stochastic_length: int = 16
-    stochastic_classes: int = 16
-    embedded_obs_size: int = 1024
+    batch_size: int = 16  # y
+    batch_length: int = 64  # y
+    stochastic_length: int = 32  # y
+    stochastic_classes: int = 32  # y
+    deterministic_size: int = 512  # y
+    embedded_obs_size: int = 4096  # y = 256 * 4 * 4
     horizon: int = 15
     gae_lambda: float = 0.95
+    gamma: float = 0.997
+    prefill: int = 1000
+    debug: bool = False
+    train_per_rollout: int = 100
+    bins = 256  # y
+    total_steps: int = 500000
 
     @property
     def stochastic_size(self):
         return self.stochastic_length * self.stochastic_classes
+
+    def __post_init__(self):
+        if self.debug:
+            self.prefill = self.num_envs
+            self.train_per_rollout = 1
 
 
 args = tyro.cli(Args)
@@ -245,174 +636,269 @@ args = tyro.cli(Args)
 ########################################################
 ## Networks
 ########################################################
+# Adapted from: https://github.com/NM512/dreamerv3-torch/blob/main/tools.py#L929
+def init_weights(m):
+    if isinstance(m, nn.Linear):
+        in_num = m.in_features
+        out_num = m.out_features
+        denoms = (in_num + out_num) / 2.0
+        scale = 1.0 / denoms
+        std = np.sqrt(scale) / 0.87962566103423978
+        nn.init.trunc_normal_(m.weight.data, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std)
+        if hasattr(m.bias, "data"):
+            m.bias.data.fill_(0.0)
+    elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+        space = m.kernel_size[0] * m.kernel_size[1]
+        in_num = space * m.in_channels
+        out_num = space * m.out_channels
+        denoms = (in_num + out_num) / 2.0
+        scale = 1.0 / denoms
+        std = np.sqrt(scale) / 0.87962566103423978
+        nn.init.trunc_normal_(m.weight.data, mean=0.0, std=std, a=-2.0, b=2.0)
+        if hasattr(m.bias, "data"):
+            m.bias.data.fill_(0.0)
+    elif isinstance(m, nn.LayerNorm):
+        m.weight.data.fill_(1.0)
+        if hasattr(m.bias, "data"):
+            m.bias.data.fill_(0.0)
+
+
+# Adapted from: https://github.com/NM512/dreamerv3-torch/blob/main/tools.py#L957
+def uniform_init_weights(given_scale):
+    def f(m):
+        if isinstance(m, nn.Linear):
+            in_num = m.in_features
+            out_num = m.out_features
+            denoms = (in_num + out_num) / 2.0
+            scale = given_scale / denoms
+            limit = np.sqrt(3 * scale)
+            nn.init.uniform_(m.weight.data, a=-limit, b=limit)
+            if hasattr(m.bias, "data"):
+                m.bias.data.fill_(0.0)
+        elif isinstance(m, nn.LayerNorm):
+            m.weight.data.fill_(1.0)
+            if hasattr(m.bias, "data"):
+                m.bias.data.fill_(0.0)
+
+    return f
+
+
 class Encoder(nn.Module):
+    ## HACK: the output size is 4096, which should be equal to args.embedded_obs_size
     def __init__(self):
         super().__init__()
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=4, stride=2, padding=1),
-            nn.Tanh(),
-            nn.Conv2d(16, 32, kernel_size=4, stride=2, padding=1),
-            nn.Tanh(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
-            nn.Tanh(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),
-            nn.Tanh(),
-            nn.Flatten(),
-            nn.Linear(128 * 4 * 4, 1024),
-            nn.Tanh(),
+            nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(32, eps=1e-3),
+            nn.SiLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(64, eps=1e-3),
+            nn.SiLU(),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(128, eps=1e-3),
+            nn.SiLU(),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(256, eps=1e-3),
+            nn.SiLU(),
         )
+        self.encoder.apply(init_weights)
 
     def forward(self, obs: Tensor) -> Tensor:
+        B = obs.shape[0]
         embedded_obs = self.encoder(obs)
-        return embedded_obs
+        return embedded_obs.reshape(B, -1)  # flatten the last 3 dimensions C, H, W
 
 
 class Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.decoder = nn.Sequential(
-            nn.Linear(args.deterministic_size + args.stochastic_size, 512),
-            nn.Unflatten(1, (512, 1, 1)),
-            nn.ConvTranspose2d(512, 64, kernel_size=5, stride=2),
-            nn.Tanh(),
-            nn.ConvTranspose2d(64, 32, kernel_size=5, stride=2),
-            nn.Tanh(),
-            nn.ConvTranspose2d(32, 16, kernel_size=6, stride=2),
-            nn.Tanh(),
-            nn.ConvTranspose2d(16, 3, kernel_size=6, stride=2),
-            nn.Tanh(),
+            nn.Linear(args.deterministic_size + args.stochastic_size, 4096),
+            nn.Unflatten(1, (256, 4, 4)),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(128, eps=1e-3),
+            nn.SiLU(),
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(64, eps=1e-3),
+            nn.SiLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1, bias=False),
+            LayerNormChannelLast(32, eps=1e-3),
+            nn.SiLU(),
+            nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),
         )
+        [m.apply(init_weights) for m in self.decoder[:-1]]
+        self.decoder[-1].apply(uniform_init_weights(1.0))
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         x = torch.cat([posterior, deterministic], dim=-1)
         input_shape = x.shape
         x = x.flatten(0, 1)
-        mean = self.decoder(x)
-        mean = mean.unflatten(0, input_shape[:2])
-        std = 1  # XXX: why std is 1?
-        dist = Independent(Normal(mean, std), 3)  # 3 is number of dimensions for observation space, shape is (3, H, W)
-        return dist
+        reconstructed_obs = self.decoder(x)
+        reconstructed_obs = reconstructed_obs.unflatten(0, input_shape[:2])
+        return reconstructed_obs
 
 
 class RecurrentModel(nn.Module):
     def __init__(self, envs):
         super().__init__()
-        self.linear = nn.Linear(args.stochastic_size + envs.single_action_space.shape[0], 200)
-        self.act = nn.Tanh()
-        self.recurrent = nn.GRUCell(200, args.deterministic_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(args.stochastic_size + envs.single_action_space.shape[0], 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+        )
+        self.recurrent = LayerNormGRUCell(
+            512, args.deterministic_size, bias=False, layer_norm_cls=nn.LayerNorm, layer_norm_kw={"eps": 1e-3}
+        )
+        self.mlp.apply(init_weights)
+        self.recurrent.apply(init_weights)
 
     def forward(self, state: Tensor, action: Tensor, deterministic: Tensor) -> Tensor:
-        x = torch.cat([state, action], dim=-1)
-        x = self.act(self.linear(x))
+        x = torch.cat([state, action], dim=1)
+        x = self.mlp(x)
         x = self.recurrent(x, deterministic)
         return x
+
+
+def _unimix(logits: Tensor) -> Tensor:
+    probs = logits.softmax(dim=-1)
+    uniform = torch.ones_like(probs) / args.stochastic_classes
+    probs = 0.99 * probs + 0.01 * uniform
+    logits = probs_to_logits(probs)
+    return logits
 
 
 class TransitionModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(args.deterministic_size, 200),
-            nn.Tanh(),
-            nn.Linear(200, 200),
-            nn.Tanh(),
-            nn.Linear(200, args.stochastic_size),
+            nn.Linear(args.deterministic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.stochastic_size),
         )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(1.0))
 
-    def forward(self, deterministic: Tensor) -> tuple[Tensor, Tensor]:
-        raw_logits = self.net(deterministic).view(-1, args.stochastic_length, args.stochastic_classes)
-        prob = F.softmax(raw_logits, dim=-1)
-        uniform_prob = torch.ones_like(prob) / args.stochastic_classes
-        mixed_prob = 0.99 * prob + 0.01 * uniform_prob
-        logits = probs_to_logits(mixed_prob)
+    def forward(self, deterministic: Tensor) -> tuple[Distribution, Tensor]:
+        logits = self.net(deterministic).view(-1, args.stochastic_length, args.stochastic_classes)
+        logits = _unimix(logits)
         dist = Independent(OneHotCategoricalStraightThrough(logits=logits), 1)
-        sample = dist.rsample()
-        return sample.view(-1, args.stochastic_size), logits
+        return dist, logits.view(-1, args.stochastic_size)
 
 
 class RepresentationModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(args.embedded_obs_size + args.deterministic_size, 200),
-            nn.Tanh(),
-            nn.Linear(200, 200),
-            nn.Tanh(),
-            nn.Linear(200, args.stochastic_size),
+            nn.Linear(args.embedded_obs_size + args.deterministic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.stochastic_size),
         )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(1.0))
 
-    def forward(self, embedded_obs: Tensor, deterministic: Tensor) -> tuple[Tensor, Tensor]:
-        x = torch.cat([embedded_obs, deterministic], dim=-1)
-        raw_logits = self.net(x).view(-1, args.stochastic_length, args.stochastic_classes)
-        prob = F.softmax(raw_logits, dim=-1)
-        uniform_prob = torch.ones_like(prob) / args.stochastic_classes
-        mixed_prob = 0.99 * prob + 0.01 * uniform_prob
-        logits = probs_to_logits(mixed_prob)
+    def forward(self, embedded_obs: Tensor, deterministic: Tensor) -> tuple[Distribution, Tensor]:
+        x = torch.cat([embedded_obs, deterministic], dim=1)
+        logits = self.net(x).view(-1, args.stochastic_length, args.stochastic_classes)
+        logits = _unimix(logits)
         dist = Independent(OneHotCategoricalStraightThrough(logits=logits), 1)
-        sample = dist.rsample()
-        return sample.view(-1, args.stochastic_size), logits
+        return dist, logits.view(-1, args.stochastic_size)
 
 
 class RewardPredictor(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(args.stochastic_size + args.deterministic_size, 400),
-            nn.Tanh(),
-            nn.Linear(400, 400),
-            nn.Tanh(),
-            nn.Linear(400, 1),
+            nn.Linear(args.deterministic_size + args.stochastic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.bins),
         )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(0.0))
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
-        x = torch.cat([posterior, deterministic], dim=-1)
-        mean = self.net(x)
-        std = 1.0
-        dist = Independent(Normal(mean, std), 1)
-        return dist
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
+        input_shape = posterior.shape
+        posterior = posterior.flatten(0, 1)
+        deterministic = deterministic.flatten(0, 1)
+        x = torch.cat([posterior, deterministic], dim=1)
+        predicted_reward_bins = self.net(x)
+        predicted_reward_bins = predicted_reward_bins.unflatten(0, input_shape[:2])
+        return predicted_reward_bins
+
+
+class ContinueModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(args.deterministic_size + args.stochastic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 1),
+        )
+        [m.apply(init_weights) for m in self.net[:-1]]
+        self.net[-1].apply(uniform_init_weights(1.0))
+
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
+        input_shape = posterior.shape
+        posterior = posterior.flatten(0, 1)
+        deterministic = deterministic.flatten(0, 1)
+        x = torch.cat([posterior, deterministic], dim=1)
+        logits = self.net(x)
+        return logits.unflatten(0, input_shape[:2])
 
 
 class Actor(nn.Module):
     def __init__(self, envs):
         super().__init__()
         self.actor = nn.Sequential(
-            nn.Linear(args.stochastic_size + args.deterministic_size, 400),
-            nn.Tanh(),
-            nn.Linear(400, 400),
-            nn.Tanh(),
-            nn.Linear(400, envs.single_action_space.shape[0] * 2),
+            nn.Linear(args.deterministic_size + args.stochastic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, envs.single_action_space.shape[0] * 2),
         )
+        [m.apply(init_weights) for m in self.actor[:-1]]
+        self.actor[-1].apply(uniform_init_weights(1.0))
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> tuple[Distribution, Tensor]:
-        std_min, std_max = 0.1, 1
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
         x = torch.cat([posterior, deterministic], dim=-1)
         mean, std = self.actor(x).chunk(2, dim=-1)
-        mean = 5 * F.tanh(mean / 5)
+        std_min, std_max = 0.1, 1
+        mean = F.tanh(mean)
         std = std_min + (std_max - std_min) * F.sigmoid(std + 2.0)
-
-        action_dist = TransformedDistribution(Normal(mean, std), TanhTransform())
-        action_dist = Independent(action_dist, 1)
-        action = action_dist.rsample()
-        return action_dist, action
+        action_dist = Independent(Normal(mean, std), 1)
+        return action_dist
 
 
 class Critic(nn.Module):
     def __init__(self):
         super().__init__()
         self.critic = nn.Sequential(
-            nn.Linear(args.stochastic_size + args.deterministic_size, 400),
-            nn.Tanh(),
-            nn.Linear(400, 400),
-            nn.Tanh(),
-            nn.Linear(400, 1),
+            nn.Linear(args.stochastic_size + args.deterministic_size, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, 512, bias=False),
+            nn.LayerNorm(512, eps=1e-3),
+            nn.SiLU(),
+            nn.Linear(512, args.bins),
         )
+        [m.apply(init_weights) for m in self.critic[:-1]]
+        self.critic[-1].apply(uniform_init_weights(0.0))
 
-    def forward(self, posterior: Tensor, deterministic: Tensor) -> Distribution:
+    def forward(self, posterior: Tensor, deterministic: Tensor) -> Tensor:
         x = torch.cat([posterior, deterministic], dim=-1)
-        mean = self.critic(x)
-        std = 1.0
-        dist = Independent(Normal(mean, std), 1)
-        return dist
+        predicted_value_bins = self.critic(x)
+        return predicted_value_bins
 
 
 ########################################################
@@ -421,23 +907,25 @@ class Critic(nn.Module):
 
 ## setup
 device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
 seed_everything(args.seed)
 enable_deterministic_run()
-envs = gym.vector.SyncVectorEnv([
-    lambda: DMCWrapper(args.env_id.removeprefix("dm_control/"), args.seed, decimation=2) for _ in range(args.num_envs)
-])
-envs = NumpyToTorch(envs, device=device)
-buffer = ReplayBuffer(envs.single_observation_space.shape, envs.single_action_space.shape[0], device)
-
-## writer
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
+
+envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2, image_size=(64, 64))
 writer = SummaryWriter(f"logdir/{run_name}")
 writer.add_text(
     "hyperparameters",
     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
 )
-
+buffer = ReplayBuffer(
+    envs.single_observation_space.shape,
+    envs.single_action_space.shape[0],
+    device,
+    num_envs=args.num_envs,
+    capacity=500_000,
+)
 
 ## networks
 encoder = Encoder().to(device)
@@ -446,8 +934,10 @@ recurrent_model = RecurrentModel(envs).to(device)
 transition_model = TransitionModel().to(device)
 representation_model = RepresentationModel().to(device)
 reward_predictor = RewardPredictor().to(device)
+continue_model = ContinueModel().to(device)
 actor = Actor(envs).to(device)
 critic = Critic().to(device)
+moments = Moments().to(device)
 model_params = chain(
     encoder.parameters(),
     decoder.parameters(),
@@ -455,51 +945,49 @@ model_params = chain(
     transition_model.parameters(),
     representation_model.parameters(),
     reward_predictor.parameters(),
+    continue_model.parameters(),
 )
-model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr)
-actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr)
+model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=1e-8)
+actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=1e-5)
+critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=1e-5)
 
-cnt_episode = 0
-
-
-## core functions
-@torch.inference_mode()
-def rollout(num_episodes: int):
-    global cnt_episode
-    for epi in range(num_episodes):
-        posterior = torch.zeros(1, args.stochastic_size, device=device)
-        deterministic = torch.zeros(1, args.deterministic_size, device=device)
-        action = torch.zeros(1, envs.single_action_space.shape[0], device=device)
-        obs, _ = envs.reset()
-        reward_sum = torch.zeros(envs.num_envs, device=device)
-        while True:
-            embeded_obs = encoder(obs)
-            deterministic = recurrent_model(posterior, action, deterministic)
-            posterior, _ = representation_model(embeded_obs, deterministic)
-            _, action = actor(posterior, deterministic)
-            next_obs, reward, terminated, truncated, _ = envs.step(action)
-            reward_sum += reward
-            done = torch.logical_or(terminated, truncated)
-            buffer.add(obs, action, reward, next_obs, done)
-            obs = next_obs
-            if done.all():
-                break
-        cnt_episode += 1
-        print(f"Episode {cnt_episode}, Return: {reward_sum.mean().item()}")
-        writer.add_scalar("charts/episodic_return", reward_sum.mean().item(), cnt_episode)
+## logging
+global_step = 0
+ratio = Ratio(ratio=0.5)
+aggregator = MetricAggregator({
+    "loss/reconstruction_loss": MeanMetric(sync_on_compute=False),
+    "loss/reward_loss": MeanMetric(sync_on_compute=False),
+    "loss/continue_loss": MeanMetric(sync_on_compute=False),
+    "loss/kl_loss": MeanMetric(sync_on_compute=False),
+    "loss/model_loss": MeanMetric(sync_on_compute=False),
+    "loss/actor_loss": MeanMetric(sync_on_compute=False),
+    "loss/value_loss": MeanMetric(sync_on_compute=False),
+    "state/kl": MeanMetric(sync_on_compute=False),
+    "state/prior_entropy": MeanMetric(sync_on_compute=False),
+    "state/posterior_entropy": MeanMetric(sync_on_compute=False),
+    "state/actor_entropy": MeanMetric(sync_on_compute=False),
+    "grad_norm/model": MeanMetric(sync_on_compute=False),
+    "grad_norm/actor": MeanMetric(sync_on_compute=False),
+    "grad_norm/critic": MeanMetric(sync_on_compute=False),
+})
 
 
-def world_model_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    # TODO: utilize "next_observation" to update the model
+    # TODO: since the replay buffer may contain termination/truncation in the middle of a rollout, we need to handle this case by resetting posterior, deterministic, and action to initial state (zero)
     posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
     deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
     embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
 
-    deterministics, priors_logits, posteriors, posteriors_logits = [], [], [], []
+    deterministics = []
+    priors_logits = []
+    posteriors = []
+    posteriors_logits = []
     for t in range(1, args.batch_length):
         deterministic = recurrent_model(posterior, data["action"][:, t - 1], deterministic)
-        _, prior_logits = transition_model(deterministic)
-        posterior, posterior_logits = representation_model(embeded_obs[:, t], deterministic)
+        prior_dist, prior_logits = transition_model(deterministic)
+        posterior_dist, posterior_logits = representation_model(embeded_obs[:, t], deterministic)
+        posterior = posterior_dist.rsample().view(-1, args.stochastic_size)
 
         deterministics.append(deterministic)
         priors_logits.append(prior_logits)
@@ -507,88 +995,176 @@ def world_model_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
         posteriors_logits.append(posterior_logits)
 
     deterministics = torch.stack(deterministics, dim=1).to(device)
-    priors_logits = torch.stack(priors_logits, dim=1).to(device)
+    prior_logits = torch.stack(priors_logits, dim=1).to(device)
     posteriors = torch.stack(posteriors, dim=1).to(device)
     posteriors_logits = torch.stack(posteriors_logits, dim=1).to(device)
 
-    reconstructed_obs_dist = decoder(posteriors, deterministics)
+    reconstructed_obs = decoder(posteriors, deterministics)
+    reconstructed_obs_dist = MSEDistribution(
+        reconstructed_obs, 3
+    )  # 3 is number of dimensions for observation space, shape is (3, H, W)
     reconstructed_obs_loss = -reconstructed_obs_dist.log_prob(data["observation"][:, 1:]).mean()
-    reward_dist = reward_predictor(posteriors, deterministics)
-    reward_loss = -reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
-    prior_dist = Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1)
-    prior_dist_sg = Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1)
-    posterior_dist = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1)
-    posterior_dist_sg = Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1)
-    prior_kl = kl_divergence(posterior_dist_sg, prior_dist)
-    posterior_kl = kl_divergence(prior_dist_sg, posterior_dist)
-    prior_kl = torch.max(prior_kl, torch.tensor(1.0, device=device))
-    posterior_kl = torch.max(posterior_kl, torch.tensor(1.0, device=device))
-    kl_loss = (1.0 * prior_kl + 0.1 * posterior_kl).mean()
+    predicted_reward_bins = reward_predictor(posteriors, deterministics)
+    predicted_reward_dist = TwoHotEncodingDistribution(predicted_reward_bins, dims=1)
+    reward_loss = -predicted_reward_dist.log_prob(data["reward"][:, 1:]).mean()
 
-    model_loss = reconstructed_obs_loss + reward_loss + kl_loss
+    predicted_continue = continue_model(posteriors, deterministics)
+    predicted_continue_dist = SafeBernoulli(logits=predicted_continue)
+    true_continue = 1 - data["terminated"][:, 1:]
+    continue_loss = -predicted_continue_dist.log_prob(true_continue).mean()
+
+    # KL balancing, Eq. 3 in the paper
+    kl = kl_loss1 = kl_divergence(
+        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1),
+    )
+    kl_loss1 = torch.max(kl_loss1, torch.tensor(1.0, device=device))
+    kl_loss2 = kl_divergence(
+        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
+    )
+    kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
+    kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
+
+    model_loss = reconstructed_obs_loss + reward_loss + continue_loss + kl_loss
 
     model_optimizer.zero_grad()
     model_loss.backward()
-    nn.utils.clip_grad_norm_(model_params, 100)
+    model_grad_norm = nn.utils.clip_grad_norm_(model_params, 1000)
     model_optimizer.step()
+
+    with torch.no_grad():
+        aggregator.update("loss/reconstruction_loss", reconstructed_obs_loss.item())
+        aggregator.update("loss/reward_loss", reward_loss.item())
+        aggregator.update("loss/continue_loss", continue_loss.item())
+        aggregator.update("loss/kl_loss", kl_loss.item())
+        aggregator.update("loss/model_loss", model_loss.item())
+        aggregator.update("state/kl", kl.mean().item())
+        aggregator.update("state/prior_entropy", prior_dist.entropy().mean().item())
+        aggregator.update("state/posterior_entropy", posterior_dist.entropy().mean().item())
+        aggregator.update("grad_norm/model", model_grad_norm.mean().item())
 
     return posteriors, deterministics
 
 
-def behavior_learning(posteriers_: Tensor, deterministics_: Tensor):
+def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     ## reuse the `posteriors` and `deterministics` from model learning, important to detach them!
-    state = posteriers_.detach().view(-1, args.stochastic_size)
+    state = posteriors_.detach().view(-1, args.stochastic_size)
     deterministic = deterministics_.detach().view(-1, args.deterministic_size)
 
     states = []
     deterministics = []
-    logprobs = []
-    # entropies = []
     for t in range(args.horizon):
-        action_dist, action = actor(state, deterministic)
+        action = actor(state, deterministic).rsample()
         deterministic = recurrent_model(state, action, deterministic)
-        state, _ = transition_model(deterministic)
-
+        state_dist, state_logits = transition_model(deterministic)
+        state = state_dist.rsample().view(-1, args.stochastic_size)
         states.append(state)
         deterministics.append(deterministic)
-        logprobs.append(action_dist.log_prob(action))
-        # entropies.append(action_dist.entropy())
 
     states = torch.stack(states, dim=1)
     deterministics = torch.stack(deterministics, dim=1)
-    logprobs = torch.stack(logprobs, dim=1)
-    # entropies = torch.stack(entropies, dim=1)
 
-    predicted_rewards = reward_predictor(states, deterministics).mean
-    values = critic(states, deterministics).mean
-    continues = torch.ones_like(values) * 0.997
-    lambda_values = compute_lambda_values(predicted_rewards, values, continues, args.horizon, device, args.gae_lambda)
-    # TODO: do advantage normalization
-    advantages = lambda_values - values[:, :-1]
+    predicted_rewards = TwoHotEncodingDistribution(reward_predictor(states, deterministics), dims=1).mean
+    predicted_values = TwoHotEncodingDistribution(critic(states, deterministics), dims=1).mean
 
-    actor_loss = -advantages.mean()  # + 0.0003 * entropies.mean()
+    continues_logits = continue_model(states, deterministics)
+    continues = SafeBernoulli(logits=continues_logits).mode
+    lambda_values = compute_lambda_values(
+        predicted_rewards, predicted_values, continues * args.gamma, args.horizon, device, args.gae_lambda
+    )
+
+    ## Normalize return, Eq. 7 in the paper
+    baselines = predicted_values[:, :-1]
+    offset, invscale = moments(lambda_values)
+    normalized_lambda_values = (lambda_values - offset) * invscale
+    normalized_baselines = (baselines - offset) * invscale
+
+    advantages = normalized_lambda_values - normalized_baselines
+
+    # TODO: what would happen if we don't use discount factor?
+    with torch.no_grad():
+        discount = torch.cumprod(continues[:, :-1] * args.gamma, dim=1) / args.gamma
+
+    actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
+    # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
+    # For discount factor, see https://ai.stackexchange.com/q/7680, though it is for REINFORCE
+    actor_loss = -((advantages + 0.0003 * actor_entropy) * discount).mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
-    nn.utils.clip_grad_norm_(actor.parameters(), 100)
+    actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
     actor_optimizer.step()
 
-    value_dist = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
-    value_loss = -value_dist.log_prob(lambda_values.detach()).mean()
+    # TODO: implement target critic
+    predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
+    predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
+    value_loss = -predicted_value_dist.log_prob(lambda_values.detach())
+    value_loss = (value_loss * discount.squeeze(-1)).mean()
     critic_optimizer.zero_grad()
     value_loss.backward()
-    nn.utils.clip_grad_norm_(critic.parameters(), 100)
+    critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 100)
     critic_optimizer.step()
+
+    with torch.no_grad():
+        aggregator.update("loss/actor_loss", actor_loss.item())
+        aggregator.update("loss/value_loss", value_loss.item())
+        aggregator.update("state/actor_entropy", actor_entropy.mean().item())
+        aggregator.update("grad_norm/actor", actor_grad_norm.mean().item())
+        aggregator.update("grad_norm/critic", critic_grad_norm.mean().item())
 
 
 def main():
-    rollout(5)
-    for i in range(args.num_iterations):
-        for _ in range(100):
-            data = buffer.sample(args.batch_size, args.batch_length)
-            posteriors, deterministics = world_model_learning(data)
-            behavior_learning(posteriors, deterministics)
-        rollout(1)
+    global global_step
+    pbar = tqdm(total=args.total_steps, desc="Training")
+    episodic_return = torch.zeros(args.num_envs, device=device)
+
+    posterior = torch.zeros(args.num_envs, args.stochastic_size, device=device)
+    deterministic = torch.zeros(args.num_envs, args.deterministic_size, device=device)
+    action = torch.zeros(args.num_envs, envs.single_action_space.shape[0], device=device)
+
+    obs, _ = envs.reset()
+    while global_step < args.total_steps:
+        ## Step the environment and add to buffer
+        with torch.inference_mode():
+            embeded_obs = encoder(obs)
+            deterministic = recurrent_model(posterior, action, deterministic)
+            posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
+            posterior = posterior_dist.sample().view(-1, args.stochastic_size)
+            if global_step < args.prefill:
+                action = torch.as_tensor(envs.action_space.sample(), device=device)
+            else:
+                action = actor(posterior, deterministic).sample()
+            next_obs, reward, terminated, truncated, info = envs.step(action)
+            done = torch.logical_or(terminated, truncated)
+            buffer.add(obs, action, reward, next_obs, done, terminated)
+            obs = next_obs
+
+            episodic_return += reward
+            if done.any():
+                writer.add_scalar("reward/episodic_return", episodic_return[done].mean().item(), global_step)
+                episodic_return[done] = 0
+                posterior[done] = 0
+                deterministic[done] = 0
+                action[done] = 0
+
+        ## Update the model
+        if global_step >= args.prefill:
+            gradient_steps = ratio(global_step - args.prefill)
+            for _ in range(gradient_steps):
+                data = buffer.sample(args.batch_size, args.batch_length)
+                posteriors, deterministics = dynamic_learning(data)
+                behavior_learning(posteriors, deterministics)
+
+        ## Logging
+        if (global_step - args.prefill) % 500 == 0:
+            metrics_dict = aggregator.compute()
+            for k, v in metrics_dict.items():
+                writer.add_scalar(k, v, global_step)
+            aggregator.reset()
+
+        global_step += args.num_envs
+        pbar.update(args.num_envs)
 
 
 if __name__ == "__main__":
