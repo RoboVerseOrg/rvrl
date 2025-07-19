@@ -36,4 +36,4 @@ uv pip install networkx==2.1
 ```
 
 ## Usage
-see `script.sh`
+see [script.sh](./script.sh)
