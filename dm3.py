@@ -5,9 +5,7 @@ try:
 except ImportError:
     pass
 
-import math
 import os
-import random
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
@@ -34,10 +32,13 @@ from torch.distributions import (
 )
 from torch.distributions.utils import probs_to_logits
 from torch.utils.tensorboard.writer import SummaryWriter
-from torchmetrics import MeanMetric, Metric
+from torchmetrics import MeanMetric
 from tqdm.rich import tqdm_rich as tqdm
 
 from src.envs.env_factory import create_vector_env
+from src.utils.metrics import MetricAggregator
+from src.utils.reproducibility import enable_deterministic_run, seed_everything
+from src.utils.utils import Ratio
 
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 
@@ -45,21 +46,6 @@ log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 ########################################################
 ## Standalone utils
 ########################################################
-def seed_everything(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-
-def enable_deterministic_run():
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
-
-
 class ReplayBuffer:
     def __init__(
         self,
@@ -416,179 +402,6 @@ class Moments(nn.Module):
             self.high = self._decay * self.high + (1 - self._decay) * high
         invscale = torch.max(1 / self._max, self.high - self.low)
         return self.low.detach(), invscale.detach()
-
-
-class MetricAggregator:
-    """A metric aggregator class to aggregate metrics to be tracked.
-    Args:
-        metrics (Optional[Dict[str, Metric]]): Dict of metrics to aggregate.
-    """
-
-    disabled: bool = False
-
-    def __init__(self, metrics: dict[str, Metric] | None = None, raise_on_missing: bool = False):
-        self.metrics: dict[str, Metric] = {}
-        if metrics is not None:
-            self.metrics = metrics
-        self._raise_on_missing = raise_on_missing
-
-    def __iter__(self):
-        return iter(self.metrics.keys())
-
-    def add(self, name: str, metric: Metric):
-        """Add a metric to the aggregator
-
-        Args:
-            name (str): Name of the metric
-            metric (Metric): Metric to add.
-
-        Raises:
-            MetricAggregatorException: If the metric already exists.
-        """
-        if not self.disabled:
-            if name not in self.metrics:
-                self.metrics.setdefault(name, metric)
-            else:
-                if self._raise_on_missing:
-                    raise ValueError(f"Metric {name} already exists")
-                else:
-                    log.warning(
-                        f"The key '{name}' is already in the metric aggregator. Nothing will be added.", UserWarning
-                    )
-
-    @torch.no_grad()
-    def update(self, name: str, value: Any) -> None:
-        """Update the metric with the value
-
-        Args:
-            name (str): Name of the metric
-            value (Any): Value to update the metric with.
-
-        Raises:
-            ValueError: If the metric does not exist.
-        """
-        if not self.disabled:
-            if name not in self.metrics:
-                if self._raise_on_missing:
-                    raise ValueError(f"Metric {name} does not exist")
-                else:
-                    log.warning(
-                        f"The key '{name}' is missing from the metric aggregator. Nothing will be added.", UserWarning
-                    )
-            else:
-                self.metrics[name].update(value)
-
-    def pop(self, name: str) -> None:
-        """Remove a metric from the aggregator with the given name
-        Args:
-            name (str): Name of the metric
-        """
-        if not self.disabled:
-            if name not in self.metrics:
-                if self._raise_on_missing:
-                    raise ValueError(f"Metric {name} does not exist")
-                else:
-                    log.warning(
-                        f"The key '{name}' is missing from the metric aggregator. Nothing will be popped.", UserWarning
-                    )
-            self.metrics.pop(name, None)
-
-    def reset(self):
-        """Reset all metrics to their initial state"""
-        if not self.disabled:
-            for metric in self.metrics.values():
-                metric.reset()
-
-    def to(self, device: str | torch.device = "cpu") -> MetricAggregator:
-        """Move all metrics to the given device
-        Args:
-            device (str |torch.device, optional): Device to move the metrics to. Defaults to "cpu".
-        """
-        if not self.disabled:
-            if self.metrics:
-                for k, v in self.metrics.items():
-                    self.metrics[k] = v.to(device)
-        return self
-
-    @torch.no_grad()
-    def compute(self) -> dict[str, Any]:
-        """Reduce the metrics to a single value
-        Returns:
-            Reduced metrics
-        """
-        reduced_metrics = {}
-        if not self.disabled:
-            if self.metrics:
-                for k, v in self.metrics.items():
-                    reduced = v.compute()
-                    is_tensor = torch.is_tensor(reduced)
-                    if is_tensor and reduced.numel() == 1:
-                        reduced_metrics[k] = reduced.item()
-                    else:
-                        if not is_tensor:
-                            log.warning(
-                                f"The reduced metric {k} is not a scalar tensor: type={type(reduced)}. "
-                                "This may create problems during the logging phase.",
-                                category=RuntimeWarning,
-                            )
-                        else:
-                            log.warning(
-                                f"The reduced metric {k} is not a scalar: size={v.size()}. "
-                                "This may create problems during the logging phase.",
-                                category=RuntimeWarning,
-                            )
-                        reduced_metrics[k] = reduced
-
-                    is_tensor = torch.is_tensor(reduced_metrics[k])
-                    if (is_tensor and torch.isnan(reduced_metrics[k]).any()) or (
-                        not is_tensor and math.isnan(reduced_metrics[k])
-                    ):
-                        reduced_metrics.pop(k, None)
-        return reduced_metrics
-
-
-class Ratio:
-    """Directly taken from Hafner et al. (2023) implementation:
-    https://github.com/danijar/dreamerv3/blob/8fa35f83eee1ce7e10f3dee0b766587d0a713a60/dreamerv3/embodied/core/when.py#L26
-    """
-
-    def __init__(self, ratio: float, pretrain_steps: int = 0):
-        if pretrain_steps < 0:
-            raise ValueError(f"'pretrain_steps' must be non-negative, got {pretrain_steps}")
-        if ratio < 0:
-            raise ValueError(f"'ratio' must be non-negative, got {ratio}")
-        self._pretrain_steps = pretrain_steps
-        self._ratio = ratio
-        self._prev = None
-
-    def __call__(self, step: int) -> int:
-        if self._ratio == 0:
-            return 0
-        if self._prev is None:
-            self._prev = step
-            repeats = int(step * self._ratio)
-            if self._pretrain_steps > 0:
-                if step < self._pretrain_steps:
-                    log.warning(
-                        "The number of pretrain steps is greater than the number of current steps. This could lead to "
-                        f"a higher ratio than the one specified ({self._ratio}). Setting the 'pretrain_steps' equal to "
-                        "the number of current steps."
-                    )
-                    self._pretrain_steps = step
-                repeats = int(self._pretrain_steps * self._ratio)
-            return repeats
-        repeats = int((step - self._prev) * self._ratio)
-        self._prev += repeats / self._ratio
-        return repeats
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"_ratio": self._ratio, "_prev": self._prev, "_pretrain_steps": self._pretrain_steps}
-
-    def load_state_dict(self, state_dict: dict[str, Any]):
-        self._ratio = state_dict["_ratio"]
-        self._prev = state_dict["_prev"]
-        self._pretrain_steps = state_dict["_pretrain_steps"]
-        return self
 
 
 ########################################################
