@@ -95,10 +95,22 @@ class DMControlRgbEnv(gym.Env):
         self.width = width
         self.height = height
         self.action_repeat = action_repeat
-        action_spec = self.env.action_spec()
-        self._action_space = spaces.Box(
-            low=-1, high=1, shape=action_spec.shape, dtype=np.float32
-        )  # XXX: may only work for walker
+        self._obs_space = spaces.Box(low=-0.5, high=0.5, shape=(3, self.width, self.height), dtype=np.float32)
+        self._true_action_space = dm_spec2gym_space(self.env.action_spec())
+        self._norm_action_space = spaces.Box(low=-1, high=1, shape=self._true_action_space.shape, dtype=np.float32)
+
+        self._obs_space.seed(seed)
+        self._true_action_space.seed(seed)
+        self._norm_action_space.seed(seed)
+
+    def _convert_action(self, action) -> np.ndarray:
+        action = action.astype(np.float64)
+        true_delta = self._true_action_space.high - self._true_action_space.low
+        norm_delta = self._norm_action_space.high - self._norm_action_space.low
+        action = (action - self._norm_action_space.low) / norm_delta
+        action = action * true_delta + self._true_action_space.low
+        action = action.astype(np.float32)
+        return action
 
     def reset(self) -> tuple[np.ndarray, dict]:
         self.env.reset()
@@ -107,6 +119,7 @@ class DMControlRgbEnv(gym.Env):
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
+        action = self._convert_action(action)
         reward = 0
         for _ in range(self.action_repeat):
             timestep = self.env.step(action)
@@ -128,11 +141,11 @@ class DMControlRgbEnv(gym.Env):
 
     @property
     def observation_space(self):
-        return spaces.Box(low=-0.5, high=0.5, shape=(3, self.width, self.height), dtype=np.float32)
+        return self._obs_space
 
     @property
     def action_space(self):
-        return self._action_space
+        return self._norm_action_space
 
     @property
     def metadata(self):
