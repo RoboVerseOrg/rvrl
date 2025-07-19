@@ -973,6 +973,8 @@ aggregator = MetricAggregator({
 
 
 def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+    # TODO: utilize "next_observation" to update the model
+    # TODO: since the replay buffer may contain termination/truncation in the middle of a rollout, we need to handle this case by resetting posterior, deterministic, and action to initial state (zero)
     posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
     deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
     embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
@@ -1025,7 +1027,6 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
     kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
 
-    ## TODO: add coefficients for loss terms
     model_loss = reconstructed_obs_loss + reward_loss + continue_loss + kl_loss
 
     model_optimizer.zero_grad()
@@ -1082,19 +1083,20 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
 
     advantages = normalized_lambda_values - normalized_baselines
 
+    # TODO: what would happen if we don't use discount factor?
     with torch.no_grad():
         discount = torch.cumprod(continues[:, :-1] * args.gamma, dim=1) / args.gamma
 
     actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
     # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
-    # For discount factor, see https://ai.stackexchange.com/q/7680
+    # For discount factor, see https://ai.stackexchange.com/q/7680, though it is for REINFORCE
     actor_loss = -((advantages + 0.0003 * actor_entropy) * discount).mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
     actor_optimizer.step()
 
-    # TODO: implement second critic
+    # TODO: implement target critic
     predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
     predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
     value_loss = -predicted_value_dist.log_prob(lambda_values.detach())
