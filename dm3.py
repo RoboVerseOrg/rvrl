@@ -414,25 +414,25 @@ class Args:
     num_envs: int = 4
     seed: int = 0
     device: str = "cuda"
-    model_lr: float = 1e-4  # y
-    actor_lr: float = 8e-5  # y
-    critic_lr: float = 8e-5  # y
-    num_iterations: int = 1000
-    batch_size: int = 16  # y
-    batch_length: int = 64  # y
-    stochastic_length: int = 32  # y
-    stochastic_classes: int = 32  # y
-    deterministic_size: int = 512  # y
-    embedded_obs_size: int = 4096  # y = 256 * 4 * 4
-    horizon: int = 15
+    amp: bool = True
+    debug: bool = False
+
+    model_lr: float = 1e-4
+    actor_lr: float = 8e-5
+    critic_lr: float = 8e-5
+    stochastic_length: int = 32
+    stochastic_classes: int = 32
+    deterministic_size: int = 512
+    embedded_obs_size: int = 4096  # = 256 * 4 * 4
     gae_lambda: float = 0.95
     gamma: float = 0.997
-    prefill: int = 1000
-    debug: bool = False
-    train_per_rollout: int = 100
-    bins = 256  # y
+    bins = 256
+
+    batch_size: int = 16
+    batch_length: int = 64
+    horizon: int = 15
     total_steps: int = 500000
-    amp: bool = True
+    prefill: int = 1000
 
     @property
     def stochastic_size(self):
@@ -440,7 +440,9 @@ class Args:
 
     def __post_init__(self):
         if self.debug:
-            self.prefill = self.num_envs
+            self.batch_size = 2
+            self.batch_length = 3
+            self.prefill = self.num_envs * self.batch_size * self.batch_length
             self.train_per_rollout = 1
 
 
