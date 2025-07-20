@@ -131,7 +131,7 @@ class ReplayBuffer:
 
 
 def compute_lambda_values(
-    rewards: Tensor, values: Tensor, continues: Tensor, horizon_length: int, device: torch.device, gae_lambda: float
+    rewards: Tensor, values: Tensor, continues: Tensor, horizon: int, gae_lambda: float
 ) -> Tensor:
     """
     Compute lambda returns (λ-returns) for Generalized Advantage Estimation (GAE).
@@ -140,27 +140,26 @@ def compute_lambda_values(
     R_t^λ = r_t + γ * [(1 - λ) * V(s_{t+1}) + λ * R_{t+1}^λ]
 
     Args:
-        rewards: (batch_size, time_step) - rewards at each timestep (r_t)
-        values: (batch_size, time_step) - value estimates at each timestep (V(s_t))
-        horizon_length: int - length of the planning horizon
-        device: torch.device - device to compute on
+        rewards: (batch_size, time_step) - r_t is the immediate reward received after taking action at time t
+        values: (batch_size, time_step) - V(s_t) is the value estimate of the state s_t
+        continues: (batch_size, time_step) - c_t is the continue flag after taking action at time t. It is already multiplied by gamma (γ).
+        horizon: int - T is the length of the planning horizon
         gae_lambda: float - lambda parameter for GAE (λ, typically 0.95)
 
     Returns:
-        Tensor: (batch_size, horizon_length-1) - lambda returns (R_t^λ)
+        Tensor: (batch_size, horizon-1) - R_t^λ is the lambda return at time t = 0, ..., T-2.
     """
-    # Given the following diagram, with horizon_length=3
-    # Actions:            a'0      a'1      a'2     a'3
-    #                     ^ \      ^ \      ^ \     ^
-    #                    /   \    /   \    /   \   /
-    #                   /     \  /     \  /     \ /
+    # Given the following diagram, with horizon=4
+    # Actions:            a'0      a'1      a'2
+    #                     ^ \      ^ \      ^ \
+    #                    /   \    /   \    /   \
+    #                   /     \  /     \  /     \
     # States:         z0  ->  z'1  ->  z'2  ->  z'3
     # Values:         v'0    [v'1]    [v'2]    [v'3]      <-- input
     # Rewards:       [r'0]   [r'1]    [r'2]     r'3       <-- input
     # Continues:     [c'0]   [c'1]    [c'2]     c'3       <-- input
     # Lambda-values: [l'0]   [l'1]    [l'2]     l'3       <-- output
 
-    # Remove last timestep since we need t+1 values
     rewards = rewards[:, :-1]
     continues = continues[:, :-1]
     next_values = values[:, 1:]
@@ -173,13 +172,13 @@ def compute_lambda_values(
 
     # Compute lambda returns backward in time
     outputs = []
-    for index in reversed(range(horizon_length - 1)):
+    for t in reversed(range(horizon - 1)):
         # R_t^λ = [r_t + γ * (1 - λ) * V(s_{t+1})] + γ * λ * R_{t+1}^λ
-        last = inputs[:, index] + continues[:, index] * gae_lambda * last
+        last = inputs[:, t] + continues[:, t] * gae_lambda * last
         outputs.append(last)
 
-    # Reverse to get chronological order and move to device
-    returns = torch.stack(list(reversed(outputs)), dim=1).to(device)
+    # Reverse to get chronological order
+    returns = torch.stack(list(reversed(outputs)), dim=1).to(values)
     return returns
 
 
@@ -409,30 +408,48 @@ class Moments(nn.Module):
 ########################################################
 @dataclass
 class Args:
-    env_id: str = "dm_control/walker-walk-v0"
     exp_name: str = "dreamerv3"
-    num_envs: int = 4
     seed: int = 0
     device: str = "cuda"
-    model_lr: float = 1e-4  # y
-    actor_lr: float = 8e-5  # y
-    critic_lr: float = 8e-5  # y
-    num_iterations: int = 1000
-    batch_size: int = 16  # y
-    batch_length: int = 64  # y
-    stochastic_length: int = 32  # y
-    stochastic_classes: int = 32  # y
-    deterministic_size: int = 512  # y
-    embedded_obs_size: int = 4096  # y = 256 * 4 * 4
+    amp: bool = True
+    debug: bool = False
+    log_every: int = 500
+    deterministic: bool = True
+
+    ## Environment
+    env_id: str = "dm_control/walker-walk-v0"
+    num_envs: int = 4
+
+    ## Training
+    batch_size: int = 16
+    batch_length: int = 64
     horizon: int = 15
+    total_steps: int = 500000
+    prefill: int = 1000
+
+    ## All models
+    bins: int = 255
+
+    ## World Model
+    model_lr: float = 1e-4
+    model_eps: float = 1e-8
+    model_clip: float = 1000.0
+    free_nats: float = 1.0
+    stochastic_length: int = 32
+    stochastic_classes: int = 32
+    deterministic_size: int = 512
+    embedded_obs_size: int = 4096  # = 256 * 4 * 4
+
+    ## Actor Critic
+    actor_lr: float = 8e-5
+    actor_eps: float = 1e-5
+    actor_clip: float = 100.0
+    actor_ent_coef: float = 0.0003
+    critic_lr: float = 8e-5
+    critic_eps: float = 1e-5
+    critic_clip: float = 100.0
     gae_lambda: float = 0.95
     gamma: float = 0.997
-    prefill: int = 1000
-    debug: bool = False
-    train_per_rollout: int = 100
-    bins = 256  # y
-    total_steps: int = 500000
-    amp: bool = True
 
     @property
     def stochastic_size(self):
@@ -440,7 +457,9 @@ class Args:
 
     def __post_init__(self):
         if self.debug:
-            self.prefill = self.num_envs
+            self.batch_size = 2
+            self.batch_length = 3
+            self.prefill = self.num_envs * self.batch_size * self.batch_length
             self.train_per_rollout = 1
 
 
@@ -723,7 +742,8 @@ class Critic(nn.Module):
 device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
 seed_everything(args.seed)
-enable_deterministic_run()
+if args.deterministic:
+    enable_deterministic_run()
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
 
@@ -761,9 +781,9 @@ model_params = chain(
     reward_predictor.parameters(),
     continue_model.parameters(),
 )
-model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=1e-8)
-actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=1e-5)
-critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=1e-5)
+model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=args.model_eps)
+actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=args.actor_eps)
+critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=args.critic_eps)
 model_scaler = torch.amp.GradScaler(enabled=args.amp)
 actor_scaler = torch.amp.GradScaler(enabled=args.amp)
 critic_scaler = torch.amp.GradScaler(enabled=args.amp)
@@ -793,7 +813,18 @@ aggregator = MetricAggregator({
 def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     # TODO: utilize "next_observation" to update the model
     # TODO: since the replay buffer may contain termination/truncation in the middle of a rollout, we need to handle this case by resetting posterior, deterministic, and action to initial state (zero)
-    with torch.autocast("cuda", enabled=args.amp):
+
+    # Given the following diagram, with batch_length=4
+    # Actions:           [a'0]    [a'1]    [a'2]    a'3  <-- input
+    #                       \        \        \
+    #                        \        \        \
+    #                         \        \        \
+    # States:          0  ->  z'1  ->  z'2  ->  z'3      <-- output
+    # Observations:   o'0    [o'1]    [o'2]    [o'3]     <-- input
+    # Rewards:                r'1      r'2      r'3      <-- output
+    # Continues:              c'1      c'2      c'3      <-- output
+
+    with torch.autocast(args.device, enabled=args.amp):
         posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
         deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
         embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
@@ -838,12 +869,12 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
             Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
             Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1),
         )
-        kl_loss1 = torch.max(kl_loss1, torch.tensor(1.0, device=device))
+        kl_loss1 = torch.max(kl_loss1, torch.tensor(args.free_nats, device=device))
         kl_loss2 = kl_divergence(
             Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1),
             Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
         )
-        kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
+        kl_loss2 = torch.max(kl_loss2, torch.tensor(args.free_nats, device=device))
         kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
 
         model_loss = reconstructed_obs_loss + reward_loss + continue_loss + kl_loss
@@ -851,7 +882,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     model_optimizer.zero_grad()
     model_scaler.scale(model_loss).backward()
     model_scaler.unscale_(model_optimizer)
-    model_grad_norm = nn.utils.clip_grad_norm_(model_params, 1000)
+    model_grad_norm = nn.utils.clip_grad_norm_(model_params, args.model_clip)
     model_scaler.step(model_optimizer)
     model_scaler.update()
 
@@ -874,7 +905,18 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     state = posteriors_.detach().view(-1, args.stochastic_size)
     deterministic = deterministics_.detach().view(-1, args.deterministic_size)
 
-    with torch.autocast("cuda", enabled=args.amp):
+    # Given the following diagram, with horizon=4
+    # Actions:            a'0      a'1      a'2       a'3
+    #                    ^  \     ^  \     ^  \      ^  \
+    #                   /    \   /    \   /    \    /    \
+    #                  /      \ /      \ /      \  /      \
+    # States:        z'0  ->  z'1  ->  z'2  ->  z'3  ->  z'4    <-- input is z'0, output is z'1~z'4
+    # Rewards:                r'1      r'2      r'3      r'4    <-- output
+    # Continues:              c'1      c'2      c'3      c'4    <-- output
+    # Values:                 v'1      v'2      v'3      v'4    <-- output
+    # Lambda-values:          l'1      l'2      l'3             <-- output
+
+    with torch.autocast(args.device, enabled=args.amp):
         states = []
         deterministics = []
         for t in range(args.horizon):
@@ -894,7 +936,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
         continues_logits = continue_model(states, deterministics)
         continues = SafeBernoulli(logits=continues_logits).mode
         lambda_values = compute_lambda_values(
-            predicted_rewards, predicted_values, continues * args.gamma, args.horizon, device, args.gae_lambda
+            predicted_rewards, predicted_values, continues * args.gamma, args.horizon, args.gae_lambda
         )
 
         ## Normalize return, Eq. 7 in the paper
@@ -912,16 +954,16 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
         actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
         # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
         # For discount factor, see https://ai.stackexchange.com/q/7680, though it is for REINFORCE
-        actor_loss = -((advantages + 0.0003 * actor_entropy) * discount).mean()
+        actor_loss = -((advantages + args.actor_ent_coef * actor_entropy) * discount).mean()
     actor_optimizer.zero_grad()
     actor_scaler.scale(actor_loss).backward()
     actor_scaler.unscale_(actor_optimizer)
-    actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
+    actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), args.actor_clip)
     actor_scaler.step(actor_optimizer)
     actor_scaler.update()
 
     # TODO: implement target critic
-    with torch.autocast("cuda", enabled=args.amp):
+    with torch.autocast(args.device, enabled=args.amp):
         predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
         predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
         value_loss = -predicted_value_dist.log_prob(lambda_values.detach())
@@ -929,7 +971,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     critic_optimizer.zero_grad()
     critic_scaler.scale(value_loss).backward()
     critic_scaler.unscale_(critic_optimizer)
-    critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 100)
+    critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), args.critic_clip)
     critic_scaler.step(critic_optimizer)
     critic_scaler.update()
 
@@ -954,15 +996,14 @@ def main():
     while global_step < args.total_steps:
         ## Step the environment and add to buffer
         with torch.inference_mode():
-            with torch.autocast("cuda", enabled=args.amp):
-                embeded_obs = encoder(obs)
-                deterministic = recurrent_model(posterior, action, deterministic)
-                posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
-                posterior = posterior_dist.sample().view(-1, args.stochastic_size)
-                if global_step < args.prefill:
-                    action = torch.as_tensor(envs.action_space.sample(), device=device)
-                else:
-                    action = actor(posterior, deterministic).sample()
+            embeded_obs = encoder(obs)
+            deterministic = recurrent_model(posterior, action, deterministic)
+            posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
+            posterior = posterior_dist.sample().view(-1, args.stochastic_size)
+            if global_step < args.prefill:
+                action = torch.as_tensor(envs.action_space.sample(), device=device)
+            else:
+                action = actor(posterior, deterministic).sample()
             next_obs, reward, terminated, truncated, info = envs.step(action)
             done = torch.logical_or(terminated, truncated)
             buffer.add(obs, action, reward, next_obs, done, terminated)
@@ -977,7 +1018,7 @@ def main():
                 action[done] = 0
 
         ## Update the model
-        if global_step >= args.prefill:
+        if global_step > args.prefill:
             gradient_steps = ratio(global_step - args.prefill)
             for _ in range(gradient_steps):
                 data = buffer.sample(args.batch_size, args.batch_length)
@@ -985,7 +1026,7 @@ def main():
                 behavior_learning(posteriors, deterministics)
 
         ## Logging
-        if (global_step - args.prefill) % 500 == 0:
+        if global_step > args.prefill and (global_step - args.prefill) % args.log_every < args.num_envs:
             metrics_dict = aggregator.compute()
             for k, v in metrics_dict.items():
                 writer.add_scalar(k, v, global_step)
