@@ -409,6 +409,8 @@ class Args:
     device: str = "cuda"
     debug: bool = False
     log_every: int = 500
+    eval_every: int = 500
+    eval_episodes: int = 8
     amp: bool = False
     deterministic: bool = False
     compile: bool = False
@@ -992,6 +994,41 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
         aggregator.update("grad_norm/critic", critic_grad_norm.mean().item())
 
 
+@torch.inference_mode()
+def evaluation(episodes: int):
+    num_envs = 1
+    episodic_returns = []
+    videos = []
+    for i in range(episodes):
+        seed = args.seed + 6666 + i  # ensure different seeds for different episodes
+        envs = create_vector_env(args.env_id, "rgb", num_envs, seed, action_repeat=2, image_size=(64, 64))
+        obs, _ = envs.reset()
+        posterior = torch.zeros(num_envs, args.stochastic_size, device=device)
+        deterministic = torch.zeros(num_envs, args.deterministic_size, device=device)
+        action = torch.zeros(num_envs, envs.single_action_space.shape[0], device=device)
+        episodic_return = torch.zeros(num_envs, device=device)
+        imgs = [obs.cpu()]
+        while True:
+            embeded_obs = encoder(obs)
+            deterministic = recurrent_model(posterior, action, deterministic)
+            posterior_dist, _ = representation_model(embeded_obs.view(num_envs, -1), deterministic)
+            posterior = posterior_dist.mode.view(-1, args.stochastic_size)
+            action = actor(posterior, deterministic).mode
+            obs, reward, terminated, truncated, info = envs.step(action)
+            done = torch.logical_or(terminated, truncated)
+            episodic_return += reward
+            if done.any():
+                break
+            imgs.append(obs.cpu())
+        video = torch.cat(imgs, dim=0)  # (T, C, H, W)
+        videos.append(video)
+        episodic_returns.append(episodic_return.item())
+        envs.close()
+    videos = torch.stack(videos)  # (N, T, C, H, W)
+    writer.add_scalar("reward/eval_episodic_return", np.mean(episodic_returns), global_step)
+    writer.add_video("eval/video", videos + 0.5, global_step, fps=15)
+
+
 def main():
     global global_step
     pbar = tqdm(total=args.total_steps, desc="Training")
@@ -1033,6 +1070,10 @@ def main():
                 data = buffer.sample(args.batch_size, args.batch_length)
                 posteriors, deterministics = dynamic_learning(data)
                 behavior_learning(posteriors, deterministics)
+
+        ## Evaluation
+        if global_step > args.prefill and (global_step - args.prefill) % args.eval_every < args.num_envs:
+            evaluation(args.eval_episodes)
 
         ## Logging
         if global_step > args.prefill and (global_step - args.prefill) % args.log_every < args.num_envs:
