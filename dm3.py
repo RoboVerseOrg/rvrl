@@ -12,7 +12,6 @@ from itertools import chain
 from typing import Any, Callable, Sequence
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic run
 
 import numpy as np
 import torch
@@ -164,22 +163,17 @@ def compute_lambda_values(
     continues = continues[:, :-1]
     next_values = values[:, 1:]
 
-    # Initialize with the last value estimate
-    last = next_values[:, -1]
-
     # Compute the base term: r_t + γ * (1 - λ) * V(s_{t+1})
     inputs = rewards + continues * next_values * (1 - gae_lambda)
 
     # Compute lambda returns backward in time
-    outputs = []
-    for t in reversed(range(horizon - 1)):
+    outputs = torch.zeros_like(values)
+    outputs[:, -1] = next_values[:, -1]  # initialize with the last value
+    for t in range(horizon - 2, -1, -1):  # t = T-2, ..., 0
         # R_t^λ = [r_t + γ * (1 - λ) * V(s_{t+1})] + γ * λ * R_{t+1}^λ
-        last = inputs[:, t] + continues[:, t] * gae_lambda * last
-        outputs.append(last)
+        outputs[:, t] = inputs[:, t] + continues[:, t] * gae_lambda * outputs[:, t + 1]
 
-    # Reverse to get chronological order
-    returns = torch.stack(list(reversed(outputs)), dim=1).to(values)
-    return returns
+    return outputs[:, :-1]
 
 
 class LayerNormChannelLast(nn.LayerNorm):
@@ -303,10 +297,12 @@ class LayerNormGRUCell(nn.Module):
 
 
 # From https://github.com/danijar/dreamerv3/blob/8fa35f83eee1ce7e10f3dee0b766587d0a713a60/dreamerv3/jaxutils.py
+@torch.jit.script
 def symlog(x: Tensor) -> Tensor:
     return torch.sign(x) * torch.log(1 + torch.abs(x))
 
 
+@torch.jit.script
 def symexp(x: Tensor) -> Tensor:
     return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
 
@@ -411,10 +407,11 @@ class Args:
     exp_name: str = "dreamerv3"
     seed: int = 0
     device: str = "cuda"
-    amp: bool = True
     debug: bool = False
     log_every: int = 500
-    deterministic: bool = True
+    amp: bool = False
+    deterministic: bool = False
+    compile: bool = False
 
     ## Environment
     env_id: str = "dm_control/walker-walk-v0"
@@ -772,6 +769,18 @@ continue_model = ContinueModel().to(device)
 actor = Actor(envs).to(device)
 critic = Critic().to(device)
 moments = Moments().to(device)
+if args.compile:
+    encoder = torch.compile(encoder)
+    decoder = torch.compile(decoder)
+    recurrent_model = torch.compile(recurrent_model)
+    transition_model = torch.compile(transition_model)
+    representation_model = torch.compile(representation_model)
+    reward_predictor = torch.compile(reward_predictor)
+    continue_model = torch.compile(continue_model)
+    actor = torch.compile(actor)
+    critic = torch.compile(critic)
+    moments = torch.compile(moments)
+
 model_params = chain(
     encoder.parameters(),
     decoder.parameters(),
