@@ -160,7 +160,6 @@ def compute_lambda_values(
     # Continues:     [c'0]   [c'1]    [c'2]     c'3       <-- input
     # Lambda-values: [l'0]   [l'1]    [l'2]     l'3       <-- output
 
-    # Remove last timestep since we need t+1 values
     rewards = rewards[:, :-1]
     continues = continues[:, :-1]
     next_values = values[:, 1:]
@@ -178,7 +177,7 @@ def compute_lambda_values(
         last = inputs[:, index] + continues[:, index] * gae_lambda * last
         outputs.append(last)
 
-    # Reverse to get chronological order and move to device
+    # Reverse to get chronological order
     returns = torch.stack(list(reversed(outputs)), dim=1).to(device)
     return returns
 
@@ -418,11 +417,22 @@ class Args:
     debug: bool = False
 
     model_lr: float = 1e-4
-    actor_lr: float = 8e-5
-    critic_lr: float = 8e-5
+    model_eps: float = 1e-8
+    model_clip: float = 1000.0
+    free_nats: float = 1.0
     stochastic_length: int = 32
     stochastic_classes: int = 32
     deterministic_size: int = 512
+
+    actor_lr: float = 8e-5
+    actor_eps: float = 1e-5
+    actor_clip: float = 100.0
+    actor_ent_coef: float = 0.0003
+
+    critic_lr: float = 8e-5
+    critic_eps: float = 1e-5
+    critic_clip: float = 100.0
+
     embedded_obs_size: int = 4096  # = 256 * 4 * 4
     gae_lambda: float = 0.95
     gamma: float = 0.997
@@ -763,9 +773,9 @@ model_params = chain(
     reward_predictor.parameters(),
     continue_model.parameters(),
 )
-model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=1e-8)
-actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=1e-5)
-critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=1e-5)
+model_optimizer = torch.optim.Adam(model_params, lr=args.model_lr, eps=args.model_eps)
+actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr, eps=args.actor_eps)
+critic_optimizer = torch.optim.Adam(critic.parameters(), lr=args.critic_lr, eps=args.critic_eps)
 model_scaler = torch.amp.GradScaler(enabled=args.amp)
 actor_scaler = torch.amp.GradScaler(enabled=args.amp)
 critic_scaler = torch.amp.GradScaler(enabled=args.amp)
@@ -795,7 +805,7 @@ aggregator = MetricAggregator({
 def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     # TODO: utilize "next_observation" to update the model
     # TODO: since the replay buffer may contain termination/truncation in the middle of a rollout, we need to handle this case by resetting posterior, deterministic, and action to initial state (zero)
-    with torch.autocast("cuda", enabled=args.amp):
+    with torch.autocast(args.device, enabled=args.amp):
         posterior = torch.zeros(args.batch_size, args.stochastic_size, device=device)
         deterministic = torch.zeros(args.batch_size, args.deterministic_size, device=device)
         embeded_obs = encoder(data["observation"].flatten(0, 1)).unflatten(0, (args.batch_size, args.batch_length))
@@ -840,12 +850,12 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
             Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
             Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1),
         )
-        kl_loss1 = torch.max(kl_loss1, torch.tensor(1.0, device=device))
+        kl_loss1 = torch.max(kl_loss1, torch.tensor(args.free_nats, device=device))
         kl_loss2 = kl_divergence(
             Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1),
             Independent(OneHotCategoricalStraightThrough(logits=prior_logits.detach()), 1),
         )
-        kl_loss2 = torch.max(kl_loss2, torch.tensor(1.0, device=device))
+        kl_loss2 = torch.max(kl_loss2, torch.tensor(args.free_nats, device=device))
         kl_loss = (0.5 * kl_loss1 + 0.1 * kl_loss2).mean()
 
         model_loss = reconstructed_obs_loss + reward_loss + continue_loss + kl_loss
@@ -853,7 +863,7 @@ def dynamic_learning(data: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
     model_optimizer.zero_grad()
     model_scaler.scale(model_loss).backward()
     model_scaler.unscale_(model_optimizer)
-    model_grad_norm = nn.utils.clip_grad_norm_(model_params, 1000)
+    model_grad_norm = nn.utils.clip_grad_norm_(model_params, args.model_clip)
     model_scaler.step(model_optimizer)
     model_scaler.update()
 
@@ -876,7 +886,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     state = posteriors_.detach().view(-1, args.stochastic_size)
     deterministic = deterministics_.detach().view(-1, args.deterministic_size)
 
-    with torch.autocast("cuda", enabled=args.amp):
+    with torch.autocast(args.device, enabled=args.amp):
         states = []
         deterministics = []
         for t in range(args.horizon):
@@ -914,16 +924,16 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
         actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
         # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
         # For discount factor, see https://ai.stackexchange.com/q/7680, though it is for REINFORCE
-        actor_loss = -((advantages + 0.0003 * actor_entropy) * discount).mean()
+        actor_loss = -((advantages + args.actor_ent_coef * actor_entropy) * discount).mean()
     actor_optimizer.zero_grad()
     actor_scaler.scale(actor_loss).backward()
     actor_scaler.unscale_(actor_optimizer)
-    actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), 100)
+    actor_grad_norm = nn.utils.clip_grad_norm_(actor.parameters(), args.actor_clip)
     actor_scaler.step(actor_optimizer)
     actor_scaler.update()
 
     # TODO: implement target critic
-    with torch.autocast("cuda", enabled=args.amp):
+    with torch.autocast(args.device, enabled=args.amp):
         predicted_value_bins = critic(states[:, :-1].detach(), deterministics[:, :-1].detach())
         predicted_value_dist = TwoHotEncodingDistribution(predicted_value_bins, dims=1)
         value_loss = -predicted_value_dist.log_prob(lambda_values.detach())
@@ -931,7 +941,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     critic_optimizer.zero_grad()
     critic_scaler.scale(value_loss).backward()
     critic_scaler.unscale_(critic_optimizer)
-    critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), 100)
+    critic_grad_norm = nn.utils.clip_grad_norm_(critic.parameters(), args.critic_clip)
     critic_scaler.step(critic_optimizer)
     critic_scaler.update()
 
@@ -956,7 +966,7 @@ def main():
     while global_step < args.total_steps:
         ## Step the environment and add to buffer
         with torch.inference_mode():
-            with torch.autocast("cuda", enabled=args.amp):
+            with torch.autocast(args.device, enabled=args.amp):
                 embeded_obs = encoder(obs)
                 deterministic = recurrent_model(posterior, action, deterministic)
                 posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
