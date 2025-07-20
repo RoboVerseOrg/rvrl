@@ -4,6 +4,7 @@ version = "0.0.1"
 requires-python = ">=3.8"
 dependencies = [
     "gymnasium==0.29.1",
+    "imageio",
     "loguru",
     "rich",
     "tensorboard",
@@ -16,8 +17,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dmc = [
-    "dm_control==1.0.31",
-    "mujoco==3.3.3",
+    "dm_control==1.0.20",
+    "mujoco==3.1.6",
+]
+humanoid_bench = [
+    "mujoco-mjx==3.1.6",
 ]
 isaaclab = [
     "torch==2.5.1+cu121",
@@ -28,6 +32,9 @@ isaacgym = [
     "isaacgym @ file:${PROJECT_ROOT}/third_party/isaacgym/python",
     "IsaacGymEnvs @ file:${PROJECT_ROOT}/third_party/IsaacGymEnvs",
 ]
+
+[tool.setuptools]
+packages = ["rvrl"]
 
 [tool.ruff]
 line-length = 120
@@ -50,6 +57,9 @@ lint.ignore = [
     "F841",  # allow unused variable
     "UP031",  # allow `%` to be used to format strings
     "NPY002",  # allow legacy `numpy.random` functions
+]
+extend-exclude = [
+    "third_party",
 ]
 
 [tool.ruff.lint.per-file-ignores]

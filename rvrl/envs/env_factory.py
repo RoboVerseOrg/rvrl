@@ -99,6 +99,18 @@ def create_vector_env(
             return envs
         else:
             raise ValueError(f"Unknown observation type: {obs_type}")
+    elif env_id.startswith("humanoid_bench/"):
+        from .humanoid_bench_env import HumanoidBenchEnv
+
+        env_fns = [
+            lambda: HumanoidBenchEnv(
+                env_id.replace("humanoid_bench/", ""), seed + i * SEED_SPACING, image_size, obs_type
+            )
+            for i in range(num_envs)
+        ]
+        envs = gym.vector.SyncVectorEnv(env_fns)
+        envs = NumpyToTorch(envs, device)
+        return envs
     elif env_id.startswith("isaaclab/"):
         from .isaaclab_env import IsaacLabEnv
 
