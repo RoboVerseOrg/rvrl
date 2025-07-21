@@ -19,8 +19,19 @@
     // Linting
     "ruff.lint.enable": true,
 
+    // Exclude
+    "files.exclude": {
+        "**/__pycache__": true,
+        "**/.ruff_cache": true,
+        "**/*.egg-info": true,
+        "build": true,
+    },
+    "search.exclude": {
+        "logdir": true,
+    },
+
     // Python extra paths
-    "python.analysis.extraPaths": [
+    "cursorpyright.analysis.extraPaths": [
         /* IssacLab */
         "${workspaceFolder}/third_party/IsaacLab/source/isaaclab",
         "${workspaceFolder}/third_party/IsaacLab/source/isaaclab_assets",
