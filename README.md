@@ -8,6 +8,16 @@ conda create -n rvrl python=3.11 -y && conda activate rvrl
 uv pip install -e ".[dmc]"
 ```
 
+Humanoid-bench environment:
+```bash
+conda activate rvrl
+uv pip install -e ".[humanoid_bench]"
+cd third_party
+git clone --depth 1 https://github.com/Fisher-Wang/humanoid-bench && cd humanoid-bench
+uv pip install -e .
+cd ../..
+```
+
 IsaacLab environment:
 ```bash
 conda create -n rvrl_lab python=3.10 -y && conda activate rvrl_lab
@@ -29,9 +39,9 @@ wget https://developer.nvidia.com/isaac-gym-preview-4 \
     && rm isaac-gym-preview-4
 find isaacgym/python -type f -name "*.py" -exec sed -i 's/np\.float/np.float32/g' {} +
 uv pip install isaacgym/python
-git clone --depth 1 https://github.com/isaac-sim/IsaacGymEnvs
-cd IsaacGymEnvs && uv pip install -e . && cd ..
-cd ..
+git clone --depth 1 https://github.com/isaac-sim/IsaacGymEnvs && cd IsaacGymEnvs
+uv pip install -e .
+cd ../..
 uv pip install networkx==2.1
 ```
 
