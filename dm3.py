@@ -410,6 +410,7 @@ class Args:
     debug: bool = False
     log_every: int = 500
     eval_every: int = 500
+    checkpoint_every: int = 10_000
     eval_episodes: int = 8
     amp: bool = False
     deterministic: bool = False
@@ -743,15 +744,20 @@ log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if
 seed_everything(args.seed)
 if args.deterministic:
     enable_deterministic_run()
+
+## logger
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
-
-envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2, image_size=(64, 64))
-writer = SummaryWriter(f"logdir/{run_name}")
+logdir = f"logdir/{run_name}"
+os.makedirs(logdir, exist_ok=True)
+writer = SummaryWriter(logdir)
 writer.add_text(
     "hyperparameters",
     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
 )
+
+## env and replay buffer
+envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2, image_size=(64, 64))
 buffer = ReplayBuffer(
     envs.single_observation_space.shape,
     envs.single_action_space.shape[0],
@@ -1029,6 +1035,33 @@ def evaluation(episodes: int):
     writer.add_video("eval/video", videos + 0.5, global_step, fps=15)
 
 
+def save_checkpoint():
+    state = {
+        "encoder": encoder.state_dict(),
+        "decoder": decoder.state_dict(),
+        "recurrent_model": recurrent_model.state_dict(),
+        "transition_model": transition_model.state_dict(),
+        "representation_model": representation_model.state_dict(),
+        "reward_predictor": reward_predictor.state_dict(),
+        "continue_model": continue_model.state_dict(),
+        "actor": actor.state_dict(),
+        "critic": critic.state_dict(),
+        "moments": moments.state_dict(),
+        "model_optimizer": model_optimizer.state_dict(),
+        "actor_optimizer": actor_optimizer.state_dict(),
+        "critic_optimizer": critic_optimizer.state_dict(),
+        "model_scaler": model_scaler.state_dict(),
+        "actor_scaler": actor_scaler.state_dict(),
+        "critic_scaler": critic_scaler.state_dict(),
+        "ratio": ratio.state_dict(),
+        "global_step": global_step,
+    }
+    checkpoint_dir = os.path.join(logdir, "ckpt")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    torch.save(state, os.path.join(checkpoint_dir, f"ckpt_{global_step}.pth"))
+    log.info(f"Saved checkpoint to {os.path.join(checkpoint_dir, f'ckpt_{global_step}.pth')}")
+
+
 def main():
     global global_step
     pbar = tqdm(total=args.total_steps, desc="Training")
@@ -1081,6 +1114,10 @@ def main():
             for k, v in metrics_dict.items():
                 writer.add_scalar(k, v, global_step)
             aggregator.reset()
+
+        ## Save checkpoint
+        if global_step > args.prefill and (global_step - args.prefill) % args.checkpoint_every < args.num_envs:
+            save_checkpoint()
 
         global_step += args.num_envs
         pbar.update(args.num_envs)
