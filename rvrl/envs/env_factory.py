@@ -121,5 +121,8 @@ def create_vector_env(
 
         envs = IsaacGymEnv(env_id, num_envs, seed=seed)
         return envs
-    else:
-        raise ValueError(f"Unknown environment: {env_id}")
+    else:  # gymnasium envs
+        env_fns = [lambda: gym.make(env_id) for _ in range(num_envs)]
+        envs = gym.vector.SyncVectorEnv(env_fns)
+        envs = NumpyToTorch(envs, device)
+        return envs
