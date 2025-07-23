@@ -120,6 +120,7 @@ class Args:
     buffer_size: int = 1_000_000
     total_timesteps: int = 1000_000
     prefill: int = 5000
+    log_every: int = 100
 
     ## train
     batch_size: int = 256
@@ -258,7 +259,7 @@ def main():
             episodic_return += reward
             if done.any():
                 writer.add_scalar("reward/episodic_return", episodic_return[done].mean().item(), global_step)
-                print(f"global_step={global_step}, episodic_return={episodic_return[done].mean().item()}")
+                tqdm.write(f"global_step={global_step}, episodic_return={episodic_return[done].mean().item()}")
                 episodic_return[done] = 0
 
         ## Update the model
@@ -297,6 +298,17 @@ def main():
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for target_param, param in zip(qf2_target.parameters(), qf2.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+
+        # Logging
+        if global_step > args.prefill and global_step % args.log_every < args.num_envs:
+            writer.add_scalar("losses/q1_loss", q1_loss.item(), global_step)
+            writer.add_scalar("losses/q2_loss", q2_loss.item(), global_step)
+            writer.add_scalar("losses/critic_loss", critic_loss.item(), global_step)
+            if "actor_loss" in locals():
+                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+            writer.add_scalar("losses/alpha", alpha, global_step)
+            writer.add_scalar("charts/q1_values", q1.mean().item(), global_step)
+            writer.add_scalar("charts/q2_values", q2.mean().item(), global_step)
 
         global_step += args.num_envs
         pbar.update(args.num_envs)
