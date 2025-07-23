@@ -16,6 +16,14 @@ python ppo.py --env-id=isaaclab/Isaac-Reach-Franka-v0 --seed 1 --num-envs=32 --l
 
 
 ########################
+## SAC
+########################
+
+## Gymnasium Tasks
+python sac.py --env-id=gym/Hopper-v4
+
+
+########################
 ## DreamerV1
 ########################
 

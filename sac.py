@@ -43,10 +43,8 @@ class ReplayBuffer:
         self.num_envs = num_envs
         self.capacity = capacity
 
-        state_type = np.uint8 if len(observation_shape) < 3 else np.float32
-
-        self.observation = np.empty((self.capacity, self.num_envs, *observation_shape), dtype=state_type)
-        self.next_observation = np.empty((self.capacity, self.num_envs, *observation_shape), dtype=state_type)
+        self.observation = np.empty((self.capacity, self.num_envs, *observation_shape), dtype=np.float32)
+        self.next_observation = np.empty((self.capacity, self.num_envs, *observation_shape), dtype=np.float32)
         self.action = np.empty((self.capacity, self.num_envs, action_size), dtype=np.float32)
         self.reward = np.empty((self.capacity, self.num_envs, 1), dtype=np.float32)
         self.done = np.empty((self.capacity, self.num_envs, 1), dtype=np.float32)
@@ -116,8 +114,8 @@ class Args:
     exp_name: str = "sac"
     seed: int = 0
     device: str = "cuda"
-    deterministic: bool = True
-    env_id: str = "dm_control/walker-walk-v0"
+    deterministic: bool = False
+    env_id: str = "gym/Hopper-v4"
     num_envs: int = 1
     buffer_size: int = 1_000_000
     total_timesteps: int = 1000_000
@@ -171,15 +169,15 @@ class Actor(nn.Module):
         return action, action_dist.log_prob(action).unsqueeze(-1)
 
         ## Option 2
-        mean, log_std = self(obs)
-        std = log_std.exp()
-        normal = Normal(mean, std)
-        x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        action = torch.tanh(x_t)
-        log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log((1 - action**2) + 1e-6)  # ! 1e-6 to avoid nan
-        log_prob = log_prob.sum(1, keepdim=True)
-        return action, log_prob
+        # mean, log_std = self(obs)
+        # std = log_std.exp()
+        # normal = Normal(mean, std)
+        # x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
+        # action = torch.tanh(x_t)
+        # log_prob = normal.log_prob(x_t)
+        # log_prob -= torch.log((1 - action**2) + 1e-6)  # ! 1e-6 to avoid nan
+        # log_prob = log_prob.sum(1, keepdim=True)
+        # return action, log_prob
 
 
 class Critic(nn.Module):
@@ -208,7 +206,6 @@ log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if
 seed_everything(args.seed)
 if args.deterministic:
     enable_deterministic_run()
-
 
 ## logger
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
