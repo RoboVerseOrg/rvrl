@@ -242,6 +242,7 @@ def main():
     global_step = 0
     pbar = tqdm(total=args.total_timesteps, desc="Training")
     episodic_return = torch.zeros(args.num_envs, device=device)
+    episodic_length = torch.zeros(args.num_envs, device=device)
 
     obs, _ = envs.reset(seed=args.seed)
     alpha = args.alpha
@@ -257,10 +258,13 @@ def main():
             buffer.add(obs, action, reward, next_obs, done, terminated)
             obs = next_obs
             episodic_return += reward
+            episodic_length += 1
             if done.any():
                 writer.add_scalar("reward/episodic_return", episodic_return[done].mean().item(), global_step)
-                tqdm.write(f"global_step={global_step}, episodic_return={episodic_return[done].mean().item()}")
+                writer.add_scalar("reward/episodic_length", episodic_length[done].mean().item(), global_step)
+                tqdm.write(f"global_step={global_step}, episodic_return={episodic_return[done].mean().item():.1f}")
                 episodic_return[done] = 0
+                episodic_length[done] = 0
 
         ## Update the model
         if global_step >= args.prefill:
