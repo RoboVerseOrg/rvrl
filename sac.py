@@ -245,7 +245,7 @@ def main():
     episodic_length = torch.zeros(args.num_envs, device=device)
 
     obs, _ = envs.reset(seed=args.seed)
-    alpha = args.alpha
+    alpha = args.alpha  # TODO: implement automatic alpha tuning
     while global_step < args.total_timesteps:
         ## Step the environment and add to buffer
         with torch.inference_mode():
