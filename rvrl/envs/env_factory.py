@@ -12,28 +12,6 @@ from rvrl.wrapper.numpy_to_torch_wrapper import NumpyToTorch
 SEED_SPACING = 1_000_000
 
 
-## Used for DMControl
-def make_env(env_id, idx, capture_video, run_name):
-    def thunk():
-        if capture_video and idx == 0:
-            env = gym.make(env_id, render_mode="rgb_array")
-            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        else:
-            env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(env)
-
-        # TODO: is below necessary?
-        # env = gym.wrappers.ClipAction(env)
-        # env = gym.wrappers.NormalizeObservation(env)
-        # env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10))
-        # env = gym.wrappers.NormalizeReward(env)
-        # env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        return env
-
-    return thunk
-
-
-## Main function to create vectorized environment
 def create_vector_env(
     env_id: str,
     obs_type: Literal["rgb", "proprio"],
@@ -122,7 +100,17 @@ def create_vector_env(
         envs = IsaacGymEnv(env_id, num_envs, seed=seed)
         return envs
     elif env_id.startswith("gym/"):  # gymnasium native envs
-        env_fns = [lambda: gym.make(env_id.replace("gym/", "")) for _ in range(num_envs)]
+
+        def make_env(env_id, seed):
+            def thunk():
+                env = gym.make(env_id)
+                env.action_space.seed(seed)
+                env.observation_space.seed(seed)
+                return env
+
+            return thunk
+
+        env_fns = [make_env(env_id.replace("gym/", ""), seed + i * SEED_SPACING) for i in range(num_envs)]
         envs = gym.vector.SyncVectorEnv(env_fns)
         envs = NumpyToTorch(envs, device)
         return envs

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, TypedDict
 
 import gymnasium as gym
+import numpy as np
 import torch
+from numpy.typing import NDArray
 from torch import Tensor
+
+
+class Info(TypedDict):
+    final_observation: NDArray[np.object_]  # array of arrays
 
 
 class BaseVecEnv(ABC):
@@ -17,11 +23,11 @@ class BaseVecEnv(ABC):
         pass
 
     @abstractmethod
-    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[Tensor, dict[str, Any]]:
+    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[Tensor, Info]:
         pass
 
     @abstractmethod
-    def step(self, action: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, dict[str, Any]]:
+    def step(self, action: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Info]:
         pass
 
     @abstractmethod
@@ -36,6 +42,16 @@ class BaseVecEnv(ABC):
     @property
     @abstractmethod
     def single_action_space(self) -> gym.spaces.Space:
+        pass
+
+    @property
+    @abstractmethod
+    def observation_space(self) -> gym.spaces.Space:
+        pass
+
+    @property
+    @abstractmethod
+    def action_space(self) -> gym.spaces.Space:
         pass
 
     @property
