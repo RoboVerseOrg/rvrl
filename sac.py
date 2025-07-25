@@ -255,6 +255,16 @@ def main():
                 action, _ = actor.get_action(obs)
             next_obs, reward, terminated, truncated, info = envs.step(action)
             done = torch.logical_or(terminated, truncated)
+            if truncated.any():
+                try:
+                    next_obs[truncated.bool()] = torch.as_tensor(
+                        np.stack(info["final_observation"][truncated.bool().numpy(force=True)]),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                except Exception as e:
+                    log.error(f"Error in final_observation: {e}")
+                    breakpoint()
             buffer.add(obs, action, reward, next_obs, done, terminated)
             obs = next_obs
             episodic_return += reward
@@ -274,7 +284,7 @@ def main():
                 qf1_next_target = qf1_target(data["next_observation"], next_action)
                 qf2_next_target = qf2_target(data["next_observation"], next_action)
                 min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_log_prob
-                next_q = data["reward"] + (1 - data["done"]) * args.gamma * min_qf_next_target
+                next_q = data["reward"] + (1 - data["terminated"]) * args.gamma * min_qf_next_target
 
             q1 = qf1(data["observation"], data["action"])
             q2 = qf2(data["observation"], data["action"])
