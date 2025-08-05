@@ -31,12 +31,13 @@ from torch.distributions import (
 )
 from torch.distributions.utils import probs_to_logits
 from torch.utils.tensorboard.writer import SummaryWriter
-from torchmetrics import MeanMetric
+from torchmetrics import MeanMetric, SumMetric
 from tqdm.rich import tqdm_rich as tqdm
 
 from rvrl.envs.env_factory import create_vector_env
 from rvrl.utils.metrics import MetricAggregator
 from rvrl.utils.reproducibility import enable_deterministic_run, seed_everything
+from rvrl.utils.timer import timer
 from rvrl.utils.utils import Ratio
 
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
@@ -1074,7 +1075,7 @@ def main():
     obs, _ = envs.reset()
     while global_step < args.total_steps:
         ## Step the environment and add to buffer
-        with torch.inference_mode():
+        with torch.inference_mode(), timer("time/step", SumMetric), timer("time/step_avg_per_env", MeanMetric):
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
             posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
@@ -1098,15 +1099,17 @@ def main():
 
         ## Update the model
         if global_step > args.prefill:
-            gradient_steps = ratio(global_step - args.prefill)
-            for _ in range(gradient_steps):
-                data = buffer.sample(args.batch_size, args.batch_length)
-                posteriors, deterministics = dynamic_learning(data)
-                behavior_learning(posteriors, deterministics)
+            with timer("time/model_update", SumMetric), timer("time/model_update_avg", MeanMetric):
+                gradient_steps = ratio(global_step - args.prefill)
+                for _ in range(gradient_steps):
+                    data = buffer.sample(args.batch_size, args.batch_length)
+                    posteriors, deterministics = dynamic_learning(data)
+                    behavior_learning(posteriors, deterministics)
 
         ## Evaluation
         if global_step > args.prefill and (global_step - args.prefill) % args.eval_every < args.num_envs:
-            evaluation(args.eval_episodes)
+            with timer("time/eval", SumMetric):
+                evaluation(args.eval_episodes)
 
         ## Logging
         if global_step > args.prefill and (global_step - args.prefill) % args.log_every < args.num_envs:
@@ -1115,9 +1118,18 @@ def main():
                 writer.add_scalar(k, v, global_step)
             aggregator.reset()
 
+            if not timer.disabled:
+                metrics_dict = timer.compute()
+                for k, v in metrics_dict.items():
+                    if k == "time/step_avg_per_env":
+                        v = v / args.num_envs
+                    writer.add_scalar(k, v, global_step)
+                timer.reset()
+
         ## Save checkpoint
         if global_step > args.prefill and (global_step - args.prefill) % args.checkpoint_every < args.num_envs:
-            save_checkpoint()
+            with timer("time/save_checkpoint", SumMetric):
+                save_checkpoint()
 
         global_step += args.num_envs
         pbar.update(args.num_envs)
