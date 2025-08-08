@@ -13,7 +13,7 @@ from rvrl.envs import BaseVecEnv
 
 class IsaacGymEnv(BaseVecEnv):
     def __init__(self, task_name: str, num_envs: int = 1, seed: int = 0, device: str = "cuda"):
-        with hydra.initialize(config_path="../../refs/minimal-stable-PPO/configs"):
+        with hydra.initialize(config_path="../../third_party/IsaacGymEnvs/isaacgymenvs/cfg"):
             cfg = hydra.compose(config_name="config", overrides=[f"task={task_name.replace('isaacgymenv/', '')}"])
         cfg.task.env.numEnvs = num_envs
         cfg.sim_device = device
