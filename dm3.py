@@ -410,7 +410,7 @@ class Args:
     device: str = "cuda"
     debug: bool = False
     log_every: int = 500
-    eval_every: int = 500
+    eval_every: int = 2000
     checkpoint_every: int = 10_000
     eval_episodes: int = 8
     amp: bool = False
@@ -960,8 +960,8 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
         ## Normalize return, Eq. 7 in the paper
         baselines = predicted_values[:, :-1]
         offset, invscale = moments(lambda_values)
-        normalized_lambda_values = (lambda_values - offset) * invscale
-        normalized_baselines = (baselines - offset) * invscale
+        normalized_lambda_values = (lambda_values - offset) / invscale
+        normalized_baselines = (baselines - offset) / invscale
 
         advantages = normalized_lambda_values - normalized_baselines
 
