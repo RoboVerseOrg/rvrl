@@ -114,5 +114,10 @@ def create_vector_env(
         envs = gym.vector.SyncVectorEnv(env_fns)
         envs = NumpyToTorch(envs, device)
         return envs
+    elif env_id.startswith("maniskill/"):
+        from .maniskill_env import ManiskillVecEnv
+
+        envs = ManiskillVecEnv(env_id.replace("maniskill/", ""), num_envs, seed, device, obs_type, image_size)
+        return envs
     else:
         raise ValueError(f"Unknown environment: {env_id}")
