@@ -27,6 +27,9 @@ humanoid_bench = [
     "mujoco-mjx==3.1.6",
     "numpy<2",  # work with dm_control 3.1.6
 ]
+maniskill = [
+    "mani_skill==3.0.0b21",
+]
 isaaclab = [
     "torch==2.5.1+cu121",
     "torchvision==0.20.1+cu121",

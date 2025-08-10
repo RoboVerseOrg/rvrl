@@ -9,3 +9,9 @@ refs/
 build/
 
 tmp*.py
+
+*.mp4
+*.png
+*.jpg
+*.jpeg
+*.gif

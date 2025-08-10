@@ -1,0 +1,45 @@
+from __future__ import annotations
+
+import imageio as iio
+import numpy as np
+import torch
+import tyro
+from torch import Tensor
+from torchvision.utils import make_grid
+
+from rvrl.envs import create_vector_env
+
+
+class VideoWriter:
+    def __init__(self, video_path: str):
+        self.video_path = video_path
+        self.images: list[np.ndarray] = []
+
+    def add(self, rgb: Tensor):
+        """
+        Args:
+            rgb: (B, C, H, W)
+        """
+        image = make_grid(rgb, nrow=int(rgb.shape[0] ** 0.5))  # (C, H, W)
+        image = image.cpu().numpy().transpose(1, 2, 0)  # (H, W, C)
+        self.images.append(image)
+
+    def save(self, fps: int = 30):
+        iio.mimsave(self.video_path, self.images, fps=fps)
+
+
+def main(env_id: str = "maniskill/TurnFaucet-v1", image_size: tuple[int, int] = (64, 64)):
+    env = create_vector_env(env_id, num_envs=1, seed=0, device="cuda", obs_type="rgb", image_size=image_size)
+    obs, _ = env.reset()
+    video_writer = VideoWriter(f"random_action_{env_id.replace('/', '_')}.mp4")
+    video_writer.add(obs)
+    for _ in range(100):
+        action = torch.randn(env.action_space.shape)
+        obs, _, _, _, _ = env.step(action)
+        video_writer.add(obs)
+    video_writer.save()
+    env.close()
+
+
+if __name__ == "__main__":
+    tyro.cli(main)
