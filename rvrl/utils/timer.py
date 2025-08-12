@@ -20,11 +20,11 @@ class timer(ContextDecorator):
     timers: dict[str, Metric] = {}
     _start_time: float | None = None
 
-    def __init__(self, name: str, metric: type[Metric] | None = None, **kwargs) -> None:
+    def __init__(self, name: str, metric: type[Metric] = SumMetric, **kwargs) -> None:
         """Add timer to dict of timers after initialization"""
         self.name = name
         if not timer.disabled and self.name is not None and self.name not in self.timers.keys():
-            self.timers.setdefault(self.name, metric(**kwargs) if metric is not None else SumMetric(**kwargs))
+            self.timers.setdefault(self.name, metric(**kwargs))
 
     def start(self) -> None:
         """Start a new timer"""

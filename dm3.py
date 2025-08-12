@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
 
@@ -31,8 +31,8 @@ from torch.distributions import (
 )
 from torch.distributions.utils import probs_to_logits
 from torch.utils.tensorboard.writer import SummaryWriter
-from torchmetrics import MeanMetric, SumMetric
-from tqdm.rich import tqdm_rich as tqdm
+from torchmetrics import MeanMetric
+from tqdm import tqdm
 
 from rvrl.envs.env_factory import create_vector_env
 from rvrl.utils.metrics import MetricAggregator
@@ -442,6 +442,7 @@ class Args:
     embedded_obs_size: int = 4096  # = 256 * 4 * 4
 
     ## Actor Critic
+    actor_grad: Literal["dynamics", "reinforce"] = "dynamics"
     actor_lr: float = 8e-5
     actor_eps: float = 1e-5
     actor_clip: float = 100.0
@@ -935,16 +936,19 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
     # Lambda-values:          l'1      l'2      l'3             <-- output
 
     with torch.autocast(args.device, enabled=args.amp):
+        actions = []
         states = []
         deterministics = []
         for t in range(args.horizon):
-            action = actor(state, deterministic).rsample()
+            action = actor(state.detach(), deterministic.detach()).rsample()  # detach help speed up about 10%
             deterministic = recurrent_model(state, action, deterministic)
             state_dist, state_logits = transition_model(deterministic)
             state = state_dist.rsample().view(-1, args.stochastic_size)
+            actions.append(action)
             states.append(state)
             deterministics.append(deterministic)
 
+        actions = torch.stack(actions, dim=1)
         states = torch.stack(states, dim=1)
         deterministics = torch.stack(deterministics, dim=1)
 
@@ -969,10 +973,15 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
         with torch.no_grad():
             discount = torch.cumprod(continues[:, :-1] * args.gamma, dim=1) / args.gamma
 
-        actor_entropy = actor(states[:, :-1], deterministics[:, :-1]).entropy().unsqueeze(-1)
-        # Below directly computes the gradient through dynamics. It is not REINFORCE. REINFORCE needs to have a log_prob term.
-        # For discount factor, see https://ai.stackexchange.com/q/7680, though it is for REINFORCE
-        actor_loss = -((advantages + args.actor_ent_coef * actor_entropy) * discount).mean()
+        actor_dist = actor(states[:, :-1], deterministics[:, :-1])
+        actor_entropy = actor_dist.entropy().unsqueeze(-1)
+        if args.actor_grad == "dynamics":
+            # Below directly computes the gradient through dynamics.
+            actor_target = advantages
+        elif args.actor_grad == "reinforce":
+            actor_target = advantages.detach() * actor_dist.log_prob(actions[:, :-1]).unsqueeze(-1)
+        # For discount factor, see https://ai.stackexchange.com/q/7680
+        actor_loss = -((actor_target + args.actor_ent_coef * actor_entropy) * discount).mean()
     actor_optimizer.zero_grad()
     actor_scaler.scale(actor_loss).backward()
     actor_scaler.unscale_(actor_optimizer)
@@ -1075,7 +1084,7 @@ def main():
     obs, _ = envs.reset()
     while global_step < args.total_steps:
         ## Step the environment and add to buffer
-        with torch.inference_mode(), timer("time/step", SumMetric), timer("time/step_avg_per_env", MeanMetric):
+        with torch.inference_mode(), timer("time/step"), timer("time/step_avg_per_env", MeanMetric):
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
             posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
@@ -1099,16 +1108,19 @@ def main():
 
         ## Update the model
         if global_step > args.prefill:
-            with timer("time/model_update", SumMetric), timer("time/model_update_avg", MeanMetric):
+            with timer("time/train"), timer("time/train_avg", MeanMetric):
                 gradient_steps = ratio(global_step - args.prefill)
                 for _ in range(gradient_steps):
-                    data = buffer.sample(args.batch_size, args.batch_length)
-                    posteriors, deterministics = dynamic_learning(data)
-                    behavior_learning(posteriors, deterministics)
+                    with timer("time/data_sample"):
+                        data = buffer.sample(args.batch_size, args.batch_length)
+                    with timer("time/dynamic_learning"):
+                        posteriors, deterministics = dynamic_learning(data)
+                    with timer("time/behavior_learning"):
+                        behavior_learning(posteriors, deterministics)
 
         ## Evaluation
         if global_step > args.prefill and (global_step - args.prefill) % args.eval_every < args.num_envs:
-            with timer("time/eval", SumMetric):
+            with timer("time/eval"):
                 evaluation(args.eval_episodes)
 
         ## Logging
@@ -1128,7 +1140,7 @@ def main():
 
         ## Save checkpoint
         if global_step > args.prefill and (global_step - args.prefill) % args.checkpoint_every < args.num_envs:
-            with timer("time/save_checkpoint", SumMetric):
+            with timer("time/save_checkpoint"):
                 save_checkpoint()
 
         global_step += args.num_envs
