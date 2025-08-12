@@ -22,6 +22,7 @@ class VideoWriter:
         """
         image = make_grid(rgb, nrow=int(rgb.shape[0] ** 0.5))  # (C, H, W)
         image = image.cpu().numpy().transpose(1, 2, 0)  # (H, W, C)
+        image = (image.clip(0, 1) * 255).astype(np.uint8)
         self.images.append(image)
 
     def save(self, fps: int = 30):

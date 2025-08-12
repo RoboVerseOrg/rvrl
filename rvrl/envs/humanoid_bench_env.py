@@ -13,7 +13,7 @@ class HumanoidBenchEnv(gym.Env):
         self.env = gym.make(env_id, render_mode="rgb_array", width=image_size[0], height=image_size[1])
         self._obs_type = obs_type
         if obs_type == "rgb":
-            self._obs_space = spaces.Box(low=-0.5, high=0.5, shape=(3, image_size[0], image_size[1]), dtype=np.float32)
+            self._obs_space = spaces.Box(low=0, high=1, shape=(3, image_size[0], image_size[1]), dtype=np.float32)
         elif obs_type == "proprio":
             self._obs_space = self.env.observation_space
         self._action_space = self.env.action_space
@@ -22,7 +22,7 @@ class HumanoidBenchEnv(gym.Env):
 
     def _get_rgb(self):
         obs = self.env.render()
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
+        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
         return obs
 
     def reset(self) -> tuple[np.ndarray, dict]:

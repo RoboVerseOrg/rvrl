@@ -6,16 +6,16 @@ except ImportError:
     pass
 
 import os
-import random
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import chain
-from typing import Sequence
+from typing import Any, Sequence
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"  # for deterministic run
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -28,6 +28,7 @@ from torch.distributions import Distribution, Independent, Normal, TanhTransform
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from rvrl.envs.env_factory import create_vector_env
+from rvrl.utils.reproducibility import enable_deterministic_run, seed_everything
 
 log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 
@@ -35,19 +36,16 @@ log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 ########################################################
 ## Standalone utils
 ########################################################
-def seed_everything(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    random.seed(seed)
+class ObsShiftWrapper(gym.Wrapper):
+    # change observation space from [0, 1] to [-0.5, 0.5]
+    # TODO: also change observation space
+    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        return obs - 0.5, info
 
-
-def enable_deterministic_run():
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)
+    def step(self, action: np.ndarray):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs - 0.5, reward, terminated, truncated, info
 
 
 class ReplayBuffer:
@@ -373,6 +371,7 @@ _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
 
 envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2, image_size=(64, 64))
+envs = ObsShiftWrapper(envs)
 writer = SummaryWriter(f"logdir/{run_name}")
 writer.add_text(
     "hyperparameters",

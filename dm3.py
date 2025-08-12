@@ -13,6 +13,7 @@ from typing import Any, Callable, Literal, Sequence
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
 
+import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,6 +47,18 @@ log.configure(handlers=[{"sink": RichHandler(), "format": "{message}"}])
 ########################################################
 ## Standalone utils
 ########################################################
+class ObsShiftWrapper(gym.Wrapper):
+    # change observation space from [0, 1] to [-0.5, 0.5]
+    # TODO: also change observation space
+    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        return obs - 0.5, info
+
+    def step(self, action: np.ndarray):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs - 0.5, reward, terminated, truncated, info
+
+
 class ReplayBuffer:
     def __init__(
         self,
@@ -760,6 +773,7 @@ writer.add_text(
 
 ## env and replay buffer
 envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2, image_size=(64, 64))
+envs = ObsShiftWrapper(envs)
 buffer = ReplayBuffer(
     envs.single_observation_space.shape,
     envs.single_action_space.shape[0],
@@ -1018,6 +1032,7 @@ def evaluation(episodes: int):
     for i in range(episodes):
         seed = args.seed + 6666 + i  # ensure different seeds for different episodes
         envs = create_vector_env(args.env_id, "rgb", num_envs, seed, action_repeat=2, image_size=(64, 64))
+        envs = ObsShiftWrapper(envs)
         obs, _ = envs.reset()
         posterior = torch.zeros(num_envs, args.stochastic_size, device=device)
         deterministic = torch.zeros(num_envs, args.deterministic_size, device=device)
