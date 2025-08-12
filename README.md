@@ -5,7 +5,7 @@
 Main environment:
 ```bash
 conda create -n rvrl python=3.11 -y && conda activate rvrl
-uv pip install -e ".[dmc]"
+uv pip install -e ".[dmc,maniskill]"
 ```
 
 Humanoid-bench environment:

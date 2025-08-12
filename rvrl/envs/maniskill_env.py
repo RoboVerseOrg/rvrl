@@ -45,8 +45,8 @@ class ManiskillVecEnv(BaseVecEnv):
         self._action_space = self.env.action_space
         self._single_action_space = self.env.single_action_space
         if obs_mode == "rgb":
-            self._obs_space = gym.spaces.Box(0, 255, shape=(num_envs, 3, image_size[0], image_size[1]), dtype=np.uint8)
-            self._single_obs_space = gym.spaces.Box(0, 255, shape=(3, image_size[0], image_size[1]), dtype=np.uint8)
+            self._obs_space = gym.spaces.Box(0, 1, shape=(num_envs, 3, image_size[0], image_size[1]), dtype=np.float32)
+            self._single_obs_space = gym.spaces.Box(0, 1, shape=(3, image_size[0], image_size[1]), dtype=np.float32)
         else:
             self._obs_space = self.env.observation_space
             self._single_obs_space = self.env.single_observation_space
@@ -57,12 +57,12 @@ class ManiskillVecEnv(BaseVecEnv):
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
         obs, info = self.env.reset(seed=seed, options={} if options is None else options)
-        return obs["rgb"].permute(0, 3, 1, 2) if self._obs_mode == "rgb" else obs, info
+        return obs["rgb"].permute(0, 3, 1, 2) / 255.0 if self._obs_mode == "rgb" else obs, info
 
     def step(self, action: Tensor):
         obs, reward, terminations, truncations, info = self.env.step(action)
         return (
-            obs["rgb"].permute(0, 3, 1, 2) if self._obs_mode == "rgb" else obs,
+            obs["rgb"].permute(0, 3, 1, 2) / 255.0 if self._obs_mode == "rgb" else obs,
             reward,
             terminations,
             truncations,

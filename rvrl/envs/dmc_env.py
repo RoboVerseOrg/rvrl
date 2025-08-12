@@ -51,6 +51,11 @@ def dm_spec2gym_space(spec) -> spaces.Space[Any]:
         raise NotImplementedError(f"Cannot convert dm_spec to gymnasium space, unknown spec: {spec}, please report.")
 
 
+_DEFAULT_CAMERA_ID = {
+    "quadruped": 2,  # same as dreamerv3
+}
+
+
 class DMControlProprioEnv(gym.Env):
     def __init__(self, env_id: str, seed: int, action_repeat: int = 1):
         domain_name = env_id.split("-")[0]
@@ -95,13 +100,14 @@ class DMControlRgbEnv(gym.Env):
         self.width = width
         self.height = height
         self.action_repeat = action_repeat
-        self._obs_space = spaces.Box(low=-0.5, high=0.5, shape=(3, self.width, self.height), dtype=np.float32)
+        self._obs_space = spaces.Box(low=0, high=1, shape=(3, self.width, self.height), dtype=np.float32)
         self._true_action_space = dm_spec2gym_space(self.env.action_spec())
         self._norm_action_space = spaces.Box(low=-1, high=1, shape=self._true_action_space.shape, dtype=np.float32)
 
         self._obs_space.seed(seed)
         self._true_action_space.seed(seed)
         self._norm_action_space.seed(seed)
+        self._camera_id = _DEFAULT_CAMERA_ID.get(domain_name, 0)
 
     def _convert_action(self, action) -> np.ndarray:
         action = action.astype(np.float64)
@@ -114,8 +120,8 @@ class DMControlRgbEnv(gym.Env):
 
     def reset(self) -> tuple[np.ndarray, dict]:
         self.env.reset()
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
+        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=self._camera_id)
+        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
         return obs, {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
@@ -129,8 +135,8 @@ class DMControlRgbEnv(gym.Env):
                 break
         truncated = timestep.last() and timestep.discount == 1.0
         terminated = timestep.last() and timestep.discount == 0.0
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=0)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0 - 0.5  # (H, W, 3) -> (3, H, W)
+        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=self._camera_id)
+        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
         return obs, reward, terminated, truncated, {}
 
     def render(self):
