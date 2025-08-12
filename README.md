@@ -2,7 +2,7 @@
 
 ## Installation
 
-Main environment:
+Main environment (Including DM-Control, ManiSkill):
 ```bash
 conda create -n rvrl python=3.11 -y && conda activate rvrl
 uv pip install -e ".[dmc,maniskill]"
@@ -11,23 +11,22 @@ uv pip install -e ".[dmc,maniskill]"
 Humanoid-bench environment:
 ```bash
 conda activate rvrl
-uv pip install -e ".[humanoid_bench]"
-cd third_party
-git clone --depth 1 https://github.com/Fisher-Wang/humanoid-bench && cd humanoid-bench
-uv pip install -e .
-cd ../..
+cd third_party && git clone --depth 1 https://github.com/Fisher-Wang/humanoid-bench && cd ..
+uv pip install -e ".[dmc,maniskill,humanoid_bench]" -e third_party/humanoid-bench
 ```
 
-IsaacLab environment:
+IsaacLab 2.2.0 environment:
 ```bash
-conda create -n rvrl_lab python=3.10 -y && conda activate rvrl_lab
-uv pip install -e ".[isaaclab]"
-cd third_party
-git clone --depth 1 --branch v2.1.0 https://github.com/isaac-sim/IsaacLab.git IsaacLab210 && cd IsaacLab210
-sed -i '/^EXTRAS_REQUIRE = {/,/^}$/c\EXTRAS_REQUIRE = {\n    "sb3": [],\n    "skrl": [],\n    "rl-games": [],\n    "rsl-rl": [],\n}' source/isaaclab_rl/setup.py
-sed -i 's/if platform\.system() == "Linux":/if False:/' source/isaaclab_mimic/setup.py
-./isaaclab.sh -i
-cd ../..
+conda activate rvrl
+cd third_party && git clone --depth 1 --branch v2.2.0 https://github.com/isaac-sim/IsaacLab.git IsaacLab220 && cd ..
+sed -i 's/gymnasium==1\.2\.0/gymnasium/g' third_party/IsaacLab220/source/isaaclab/setup.py
+uv pip install -e ".[dmc,maniskill,humanoid_bench,isaaclab]" -e "third_party/IsaacLab220/source/isaaclab" -e "third_party/IsaacLab220/source/isaaclab_tasks"
+```
+
+Gymnasium-robotics environment:
+```bash
+conda create -n rvrl_gr python=3.11 -y && conda activate rvrl_gr
+uv pip install -e ".[gymnasium_robotics]"
 ```
 
 IsaacGym environment:
@@ -43,6 +42,18 @@ git clone --depth 1 https://github.com/isaac-sim/IsaacGymEnvs && cd IsaacGymEnvs
 uv pip install -e .
 cd ../..
 uv pip install networkx==2.1
+```
+
+IsaacLab 2.1.1 environment:
+```bash
+conda create -n rvrl_lab python=3.10 -y && conda activate rvrl_lab
+uv pip install -e ".[isaaclab]"
+cd third_party
+git clone --depth 1 --branch v2.1.0 https://github.com/isaac-sim/IsaacLab.git IsaacLab210 && cd IsaacLab210
+sed -i '/^EXTRAS_REQUIRE = {/,/^}$/c\EXTRAS_REQUIRE = {\n    "sb3": [],\n    "skrl": [],\n    "rl-games": [],\n    "rsl-rl": [],\n}' source/isaaclab_rl/setup.py
+sed -i 's/if platform\.system() == "Linux":/if False:/' source/isaaclab_mimic/setup.py
+./isaaclab.sh -i
+cd ../..
 ```
 
 ## Usage

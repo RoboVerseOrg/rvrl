@@ -3,7 +3,7 @@ name = "rvrl"
 version = "0.0.1"
 requires-python = ">=3.8"
 dependencies = [
-    "gymnasium==0.29.1",
+    "gymnasium",
     "imageio",
     "loguru",
     "moviepy==1.0.3",  # see https://github.com/pytorch/pytorch/issues/147317
@@ -18,22 +18,25 @@ dependencies = [
 
 [project.optional-dependencies]
 dmc = [
+    "gymnasium==0.29.1",
     "dm_control==1.0.20",
     "mujoco==3.1.6",
     "numpy<2",  # work with dm_control 1.0.20
 ]
 humanoid_bench = [
+    "gymnasium==0.29.1",
     "dm_control==1.0.20",
     "mujoco-mjx==3.1.6",
     "numpy<2",  # work with dm_control 3.1.6
+]
+gymnasium_robotics = [
+    "gymnasium-robotics",
 ]
 maniskill = [
     "mani_skill==3.0.0b21",
 ]
 isaaclab = [
-    "torch==2.5.1+cu121",
-    "torchvision==0.20.1+cu121",
-    "isaacsim[all,extscache]==4.5.0",
+    "isaacsim[all,extscache]==5.0.0",
 ]
 isaacgym = [
     "isaacgym @ file:${PROJECT_ROOT}/third_party/isaacgym/python",
