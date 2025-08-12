@@ -31,7 +31,7 @@ from torch.distributions import (
 )
 from torch.distributions.utils import probs_to_logits
 from torch.utils.tensorboard.writer import SummaryWriter
-from torchmetrics import MeanMetric, SumMetric
+from torchmetrics import MeanMetric
 from tqdm import tqdm
 
 from rvrl.envs.env_factory import create_vector_env
@@ -1084,7 +1084,7 @@ def main():
     obs, _ = envs.reset()
     while global_step < args.total_steps:
         ## Step the environment and add to buffer
-        with torch.inference_mode(), timer("time/step", SumMetric), timer("time/step_avg_per_env", MeanMetric):
+        with torch.inference_mode(), timer("time/step"), timer("time/step_avg_per_env", MeanMetric):
             embeded_obs = encoder(obs)
             deterministic = recurrent_model(posterior, action, deterministic)
             posterior_dist, _ = representation_model(embeded_obs.view(args.num_envs, -1), deterministic)
@@ -1108,16 +1108,19 @@ def main():
 
         ## Update the model
         if global_step > args.prefill:
-            with timer("time/model_update", SumMetric), timer("time/model_update_avg", MeanMetric):
+            with timer("time/train"), timer("time/train_avg", MeanMetric):
                 gradient_steps = ratio(global_step - args.prefill)
                 for _ in range(gradient_steps):
-                    data = buffer.sample(args.batch_size, args.batch_length)
-                    posteriors, deterministics = dynamic_learning(data)
-                    behavior_learning(posteriors, deterministics)
+                    with timer("time/data_sample"):
+                        data = buffer.sample(args.batch_size, args.batch_length)
+                    with timer("time/dynamic_learning"):
+                        posteriors, deterministics = dynamic_learning(data)
+                    with timer("time/behavior_learning"):
+                        behavior_learning(posteriors, deterministics)
 
         ## Evaluation
         if global_step > args.prefill and (global_step - args.prefill) % args.eval_every < args.num_envs:
-            with timer("time/eval", SumMetric):
+            with timer("time/eval"):
                 evaluation(args.eval_episodes)
 
         ## Logging
@@ -1137,7 +1140,7 @@ def main():
 
         ## Save checkpoint
         if global_step > args.prefill and (global_step - args.prefill) % args.checkpoint_every < args.num_envs:
-            with timer("time/save_checkpoint", SumMetric):
+            with timer("time/save_checkpoint"):
                 save_checkpoint()
 
         global_step += args.num_envs
