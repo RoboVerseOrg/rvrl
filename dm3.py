@@ -940,7 +940,7 @@ def behavior_learning(posteriors_: Tensor, deterministics_: Tensor):
         states = []
         deterministics = []
         for t in range(args.horizon):
-            action = actor(state, deterministic).rsample()
+            action = actor(state.detach(), deterministic.detach()).rsample()  # detach help speed up about 10%
             deterministic = recurrent_model(state, action, deterministic)
             state_dist, state_logits = transition_model(deterministic)
             state = state_dist.rsample().view(-1, args.stochastic_size)
