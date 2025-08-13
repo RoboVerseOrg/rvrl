@@ -20,7 +20,7 @@ def torch_to_numpy(x: torch.Tensor) -> np.ndarray:
     return x.detach().cpu().numpy()
 
 
-class NumpyToTorch(gym.Wrapper, gym.utils.RecordConstructorArgs):
+class NumpyToTorch:
     """Wraps a NumPy-based environment such that it can be interacted with PyTorch Tensors.
 
     Actions must be provided as PyTorch Tensors and observations will be returned as PyTorch Tensors.
@@ -47,9 +47,6 @@ class NumpyToTorch(gym.Wrapper, gym.utils.RecordConstructorArgs):
         <class 'bool'>
         >>> type(truncated)
         <class 'bool'>
-
-    Change logs:
-     * v1.0.0 - Initially added
     """
 
     def __init__(self, env: gym.Env, device: Device | None = None):
@@ -59,10 +56,8 @@ class NumpyToTorch(gym.Wrapper, gym.utils.RecordConstructorArgs):
             env: The NumPy-based environment to wrap
             device: The device the torch Tensors should be moved to
         """
-        gym.utils.RecordConstructorArgs.__init__(self, device=device)
-        gym.Wrapper.__init__(self, env)
-
         self.device: Device | None = device
+        self.env = env
 
     def step(self, action: torch.Tensor) -> tuple[torch.Tensor, float, bool, bool, dict]:
         """Using a PyTorch based action that is converted to NumPy to be used by the environment.
@@ -104,3 +99,19 @@ class NumpyToTorch(gym.Wrapper, gym.utils.RecordConstructorArgs):
 
     def render(self) -> None:
         raise NotImplementedError
+
+    @property
+    def observation_space(self):
+        return self.env.observation_space
+
+    @property
+    def single_observation_space(self):
+        return self.env.single_observation_space
+
+    @property
+    def action_space(self):
+        return self.env.action_space
+
+    @property
+    def single_action_space(self):
+        return self.env.single_action_space

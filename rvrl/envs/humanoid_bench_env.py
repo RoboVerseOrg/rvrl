@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import gymnasium as gym
 import humanoid_bench  # noqa: F401
@@ -25,7 +25,7 @@ class HumanoidBenchEnv(gym.Env):
         obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
         return obs
 
-    def reset(self) -> tuple[np.ndarray, dict]:
+    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:
         obs, _ = self.env.reset()
         if self._obs_type == "rgb":
             obs = self._get_rgb()

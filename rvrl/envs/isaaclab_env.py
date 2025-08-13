@@ -34,8 +34,16 @@ class IsaacLabEnv(BaseVecEnv):
         return self.envs.unwrapped.single_observation_space["policy"]
 
     @property
+    def observation_space(self):
+        return self.envs.unwrapped.observation_space["policy"]
+
+    @property
     def single_action_space(self):
         return self.envs.unwrapped.single_action_space
+
+    @property
+    def action_space(self):
+        return self.envs.unwrapped.action_space
 
     @property
     def num_envs(self) -> int:
