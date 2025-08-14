@@ -8,9 +8,9 @@ except ImportError:
 import os
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import chain
 
 os.environ["MUJOCO_GL"] = "egl"  # significantly faster rendering compared to glfw and osmesa
+
 
 import numpy as np
 import torch
@@ -19,12 +19,14 @@ import torch.nn.functional as F
 import tyro
 from loguru import logger as log
 from torch import Tensor
-from torch.distributions import Independent, Normal, TanhTransform, TransformedDistribution
 from torch.utils.tensorboard.writer import SummaryWriter
+from torchmetrics import MeanMetric
 from tqdm import tqdm
 
 from rvrl.envs.env_factory import create_vector_env
+from rvrl.utils.metrics import MetricAggregator
 from rvrl.utils.reproducibility import enable_deterministic_run, seed_everything
+from rvrl.utils.timer import timer
 
 
 ########################################################
@@ -111,26 +113,24 @@ class ReplayBuffer:
 ########################################################
 @dataclass
 class Args:
-    exp_name: str = "sac"
+    exp_name: str = "ddpg"
     seed: int = 0
     device: str = "cuda"
     deterministic: bool = False
     env_id: str = "gym/Hopper-v4"
     num_envs: int = 1
     buffer_size: int = 1_000_000
-    total_timesteps: int = 1000_000
-    prefill: int = 5000
+    total_timesteps: int = 1_000_000
+    prefill: int = 25_000
     log_every: int = 100
 
     ## train
     batch_size: int = 256
     actor_lr: float = 3e-4
-    critic_lr: float = 1e-3
+    q_lr: float = 3e-4
     gamma: float = 0.99  # discount factor
-    policy_frequency: int = 2
-    target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
-    alpha: float = 0.2
     tau: float = 0.005
+    expl_noise_std: float = 0.1
 
 
 args = tyro.cli(Args)
@@ -147,41 +147,17 @@ class Actor(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(256, 2 * np.prod(env.single_action_space.shape)),
+            nn.Linear(256, np.prod(env.single_action_space.shape)),
         )
 
     def forward(self, obs):
-        mean, log_std = self.actor(obs).chunk(2, dim=-1)
-        log_std_min, log_std_max = -5, 2
-        log_std = log_std_min + (log_std_max - log_std_min) * (F.tanh(log_std) + 1) / 2
-        return mean, log_std
-
-    def get_action(self, obs):
-        # assume action is bounded in [-1, 1], which is the value range of tanh. Otherwise we need to add an affine transform
-
-        ## Option 1
-        mean, log_std = self.forward(obs)
-        std = log_std.exp()
-        action_dist = TransformedDistribution(
-            Normal(mean, std), TanhTransform(cache_size=1)
-        )  # ! use cache_size=1 to avoid atanh which could cause nan
-        action_dist = Independent(action_dist, 1)
-        action = action_dist.rsample()
-        return action, action_dist.log_prob(action).unsqueeze(-1)
-
-        ## Option 2
-        # mean, log_std = self(obs)
-        # std = log_std.exp()
-        # normal = Normal(mean, std)
-        # x_t = normal.rsample()  # for reparameterization trick (mean + std * N(0,1))
-        # action = torch.tanh(x_t)
-        # log_prob = normal.log_prob(x_t)
-        # log_prob -= torch.log((1 - action**2) + 1e-6)  # ! 1e-6 to avoid nan
-        # log_prob = log_prob.sum(1, keepdim=True)
-        # return action, log_prob
+        # assume action is bounded in [-1, 1], which is the value range of tanh. Otherwise we need to apply an affine transform
+        x = self.actor(obs)
+        x = F.tanh(x)
+        return x
 
 
-class Critic(nn.Module):
+class QNet(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.qnet = nn.Sequential(
@@ -208,6 +184,12 @@ seed_everything(args.seed)
 if args.deterministic:
     enable_deterministic_run()
 
+## env and replay buffer
+envs = create_vector_env(args.env_id, "proprio", args.num_envs, args.seed)
+buffer = ReplayBuffer(
+    envs.single_observation_space.shape, envs.single_action_space.shape[0], device, args.num_envs, args.buffer_size
+)
+
 ## logger
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
@@ -219,40 +201,68 @@ writer.add_text(
     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
 )
 
-## env and replay buffer
-envs = create_vector_env(args.env_id, "proprio", args.num_envs, args.seed)
-buffer = ReplayBuffer(
-    envs.single_observation_space.shape, envs.single_action_space.shape[0], device, args.num_envs, args.buffer_size
-)
-
 ## networks
 actor = Actor(envs).to(device)
-qf1 = Critic(envs).to(device)
-qf2 = Critic(envs).to(device)
-qf1_target = Critic(envs).to(device)
-qf2_target = Critic(envs).to(device)
-qf1_target.load_state_dict(qf1.state_dict())
-qf2_target.load_state_dict(qf2.state_dict())
-
+qf = QNet(envs).to(device)
+actor_target = Actor(envs).to(device)
+qf_target = QNet(envs).to(device)
+actor_target.load_state_dict(actor.state_dict())
+qf_target.load_state_dict(qf.state_dict())
 actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-critic_optimizer = torch.optim.Adam(chain(qf1.parameters(), qf2.parameters()), lr=args.critic_lr)
+qf_optimizer = torch.optim.Adam(qf.parameters(), lr=args.q_lr)
+
+## logging
+global_step = 0
+aggregator = MetricAggregator({
+    "loss/q_loss": MeanMetric(),
+    "loss/actor_loss": MeanMetric(),
+    "state/q_value": MeanMetric(),
+})
+
+
+def update_model(data: dict[str, Tensor]):
+    with torch.no_grad():
+        next_action = actor_target(data["next_observation"])
+        next_target = qf_target(data["next_observation"], next_action)
+        q_target = data["reward"] + (1 - data["terminated"]) * args.gamma * next_target
+
+    q = qf(data["observation"], data["action"])
+    q_loss = F.mse_loss(q, q_target)
+    qf_optimizer.zero_grad()
+    q_loss.backward()
+    qf_optimizer.step()
+
+    actor_loss = -qf(data["observation"], actor(data["observation"])).mean()
+    actor_optimizer.zero_grad()
+    actor_loss.backward()
+    actor_optimizer.step()
+
+    for target_param, param in zip(actor_target.parameters(), actor.parameters()):
+        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+    for target_param, param in zip(qf_target.parameters(), qf.parameters()):
+        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+
+    aggregator.update("state/q_value", q.mean().item())
+    aggregator.update("loss/q_loss", q_loss.item())
+    aggregator.update("loss/actor_loss", actor_loss.item())
 
 
 def main():
-    global_step = 0
+    global global_step
     pbar = tqdm(total=args.total_timesteps, desc="Training")
     episodic_return = torch.zeros(args.num_envs, device=device)
     episodic_length = torch.zeros(args.num_envs, device=device)
 
     obs, _ = envs.reset(seed=args.seed)
-    alpha = args.alpha  # TODO: implement automatic alpha tuning
     while global_step < args.total_timesteps:
         ## Step the environment and add to buffer
-        with torch.inference_mode():
+        with torch.inference_mode(), timer("time/step"):
             if global_step < args.prefill:
                 action = torch.as_tensor(envs.action_space.sample(), device=device)
             else:
-                action, _ = actor.get_action(obs)
+                action = actor(obs)
+                action += torch.randn_like(action) * args.expl_noise_std
+                action = action.clamp(-1, 1)
             next_obs, reward, terminated, truncated, info = envs.step(action)
             done = torch.logical_or(terminated, truncated)
             real_next_obs = next_obs.clone()
@@ -275,51 +285,22 @@ def main():
 
         ## Update the model
         if global_step >= args.prefill:
-            data = buffer.sample(args.batch_size)
-            with torch.no_grad():
-                next_action, next_log_prob = actor.get_action(data["next_observation"])
-                qf1_next_target = qf1_target(data["next_observation"], next_action)
-                qf2_next_target = qf2_target(data["next_observation"], next_action)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_log_prob
-                next_q = data["reward"] + (1 - data["terminated"]) * args.gamma * min_qf_next_target
+            with timer("time/train"):
+                with timer("time/data_sample"):
+                    data = buffer.sample(args.batch_size)
+                with timer("time/update_model"):
+                    update_model(data)
 
-            q1 = qf1(data["observation"], data["action"])
-            q2 = qf2(data["observation"], data["action"])
-            q1_loss = F.mse_loss(q1, next_q)
-            q2_loss = F.mse_loss(q2, next_q)
-            critic_loss = q1_loss + q2_loss
-            critic_optimizer.zero_grad()
-            critic_loss.backward()
-            critic_optimizer.step()
-
-            if global_step % args.policy_frequency == 0:
-                for _ in range(args.policy_frequency):
-                    action, log_prob = actor.get_action(data["observation"])
-                    q1 = qf1(data["observation"], action)
-                    q2 = qf2(data["observation"], action)
-                    min_q = torch.min(q1, q2)
-                    actor_loss = (alpha * log_prob - min_q).mean()
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    actor_optimizer.step()
-
-            ## Target network update
-            if global_step % args.target_network_frequency == 0:
-                for target_param, param in zip(qf1_target.parameters(), qf1.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-                for target_param, param in zip(qf2_target.parameters(), qf2.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-
-        # Logging
+        ## Logging
         if global_step > args.prefill and global_step % args.log_every < args.num_envs:
-            writer.add_scalar("loss/q1_loss", q1_loss.item(), global_step)
-            writer.add_scalar("loss/q2_loss", q2_loss.item(), global_step)
-            writer.add_scalar("loss/critic_loss", critic_loss.item(), global_step)
-            if "actor_loss" in locals():
-                writer.add_scalar("loss/actor_loss", actor_loss.item(), global_step)
-            writer.add_scalar("loss/alpha", alpha, global_step)
-            writer.add_scalar("state/q1_value", q1.mean().item(), global_step)
-            writer.add_scalar("state/q2_value", q2.mean().item(), global_step)
+            for k, v in aggregator.compute().items():
+                writer.add_scalar(k, v, global_step)
+            aggregator.reset()
+
+            if not timer.disabled:
+                for k, v in timer.compute().items():
+                    writer.add_scalar(k, v, global_step)
+                timer.reset()
 
         global_step += args.num_envs
         pbar.update(args.num_envs)
