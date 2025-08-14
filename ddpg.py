@@ -18,6 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tyro
 from loguru import logger as log
+from tensordict import TensorDict, from_module
+from tensordict.nn import CudaGraphModule
 from torch import Tensor
 from torch.utils.tensorboard.writer import SummaryWriter
 from torchmetrics import MeanMetric
@@ -97,14 +99,16 @@ class ReplayBuffer:
         done = torch.as_tensor(flatten(self.done)[flattened_index], device=self.device)
         terminated = torch.as_tensor(flatten(self.terminated)[flattened_index], device=self.device)
 
-        sample = {
-            "observation": observation,
-            "action": action,
-            "reward": reward,
-            "next_observation": next_observation,
-            "done": done,
-            "terminated": terminated,
-        }
+        sample = TensorDict(
+            observation=observation,
+            action=action,
+            reward=reward,
+            next_observation=next_observation,
+            done=done,
+            terminated=terminated,
+            batch_size=observation.shape[0],
+            device=self.device,
+        )
         return sample
 
 
@@ -123,6 +127,8 @@ class Args:
     total_timesteps: int = 1_000_000
     prefill: int = 25_000
     log_every: int = 100
+    compile: bool = False
+    cudagraph: bool = False
 
     ## train
     batch_size: int = 256
@@ -202,14 +208,20 @@ writer.add_text(
 )
 
 ## networks
-actor = Actor(envs).to(device)
 qf = QNet(envs).to(device)
-actor_target = Actor(envs).to(device)
 qf_target = QNet(envs).to(device)
-actor_target.load_state_dict(actor.state_dict())
 qf_target.load_state_dict(qf.state_dict())
-actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
+qf_params = from_module(qf).data
+qf_target_params = from_module(qf_target).data
+
+actor = Actor(envs).to(device)
+actor_target = Actor(envs).to(device)
+actor_target.load_state_dict(actor.state_dict())
+actor_params = from_module(actor).data
+actor_target_params = from_module(actor_target).data
+
 qf_optimizer = torch.optim.Adam(qf.parameters(), lr=args.q_lr)
+actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 
 ## logging
 global_step = 0
@@ -220,31 +232,39 @@ aggregator = MetricAggregator({
 })
 
 
-def update_model(data: dict[str, Tensor]):
-    with torch.no_grad():
-        next_action = actor_target(data["next_observation"])
-        next_target = qf_target(data["next_observation"], next_action)
-        q_target = data["reward"] + (1 - data["terminated"]) * args.gamma * next_target
+def update_model(data: dict[str, Tensor]) -> TensorDict:
+    observation = data["observation"]
+    action = data["action"]
+    reward = data["reward"]
+    next_observation = data["next_observation"]
+    terminated = data["terminated"]
 
-    q = qf(data["observation"], data["action"])
+    with torch.no_grad():
+        next_action = actor_target(next_observation)
+        next_target = qf_target(next_observation, next_action)
+        q_target = reward + (1 - terminated) * args.gamma * next_target
+
+    q = qf(observation, action)
     q_loss = F.mse_loss(q, q_target)
     qf_optimizer.zero_grad()
     q_loss.backward()
     qf_optimizer.step()
 
-    actor_loss = -qf(data["observation"], actor(data["observation"])).mean()
+    actor_loss = -qf(observation, actor(observation)).mean()
     actor_optimizer.zero_grad()
     actor_loss.backward()
     actor_optimizer.step()
 
-    for target_param, param in zip(actor_target.parameters(), actor.parameters()):
-        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-    for target_param, param in zip(qf_target.parameters(), qf.parameters()):
-        target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+    actor_target_params.lerp_(actor_params.data, args.tau)
+    qf_target_params.lerp_(qf_params.data, args.tau)
 
-    aggregator.update("state/q_value", q.mean().item())
-    aggregator.update("loss/q_loss", q_loss.item())
-    aggregator.update("loss/actor_loss", actor_loss.item())
+    return TensorDict(q_loss=q_loss.detach(), q_value=q.detach().mean(), actor_loss=actor_loss.detach())
+
+
+if args.compile:
+    update_model = torch.compile(update_model)
+if args.cudagraph:
+    update_model = CudaGraphModule(update_model, in_keys=[], out_keys=[], warmup=5)
 
 
 def main():
@@ -289,7 +309,12 @@ def main():
                 with timer("time/data_sample"):
                     data = buffer.sample(args.batch_size)
                 with timer("time/update_model"):
-                    update_model(data)
+                    metrics = update_model(data)
+
+            with torch.no_grad(), timer("time/update_metrics"):
+                aggregator.update("loss/q_loss", metrics["q_loss"].item())
+                aggregator.update("loss/actor_loss", metrics["actor_loss"].item())
+                aggregator.update("state/q_value", metrics["q_value"].item())
 
         ## Logging
         if global_step > args.prefill and global_step % args.log_every < args.num_envs:
