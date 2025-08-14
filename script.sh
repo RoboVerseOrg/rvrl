@@ -24,6 +24,14 @@ python sac.py --env-id=gym/Hopper-v4
 
 
 ########################
+## DDPG
+########################
+
+## Gymnasium Tasks
+python ddpg.py --env-id=gym/Hopper-v4
+
+
+########################
 ## DreamerV1
 ########################
 
