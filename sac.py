@@ -255,17 +255,14 @@ def main():
                 action, _ = actor.get_action(obs)
             next_obs, reward, terminated, truncated, info = envs.step(action)
             done = torch.logical_or(terminated, truncated)
+            real_next_obs = next_obs.clone()
             if truncated.any():
-                try:
-                    next_obs[truncated.bool()] = torch.as_tensor(
-                        np.stack(info["final_observation"][truncated.bool().numpy(force=True)]),
-                        device=device,
-                        dtype=torch.float32,
-                    )
-                except Exception as e:
-                    log.error(f"Error in final_observation: {e}")
-                    breakpoint()
-            buffer.add(obs, action, reward, next_obs, done, terminated)
+                real_next_obs[truncated.bool()] = torch.as_tensor(
+                    np.stack(info["final_observation"][truncated.bool().numpy(force=True)]),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            buffer.add(obs, action, reward, real_next_obs, done, terminated)
             obs = next_obs
             episodic_return += reward
             episodic_length += 1
@@ -315,14 +312,14 @@ def main():
 
         # Logging
         if global_step > args.prefill and global_step % args.log_every < args.num_envs:
-            writer.add_scalar("losses/q1_loss", q1_loss.item(), global_step)
-            writer.add_scalar("losses/q2_loss", q2_loss.item(), global_step)
-            writer.add_scalar("losses/critic_loss", critic_loss.item(), global_step)
+            writer.add_scalar("loss/q1_loss", q1_loss.item(), global_step)
+            writer.add_scalar("loss/q2_loss", q2_loss.item(), global_step)
+            writer.add_scalar("loss/critic_loss", critic_loss.item(), global_step)
             if "actor_loss" in locals():
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-            writer.add_scalar("losses/alpha", alpha, global_step)
-            writer.add_scalar("charts/q1_values", q1.mean().item(), global_step)
-            writer.add_scalar("charts/q2_values", q2.mean().item(), global_step)
+                writer.add_scalar("loss/actor_loss", actor_loss.item(), global_step)
+            writer.add_scalar("loss/alpha", alpha, global_step)
+            writer.add_scalar("state/q1_value", q1.mean().item(), global_step)
+            writer.add_scalar("state/q2_value", q2.mean().item(), global_step)
 
         global_step += args.num_envs
         pbar.update(args.num_envs)
