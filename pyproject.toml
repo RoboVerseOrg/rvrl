@@ -9,6 +9,7 @@ dependencies = [
     "moviepy==1.0.3",  # see https://github.com/pytorch/pytorch/issues/147317
     "rich",
     "tensorboard",
+    "tensordict",
     "torch",
     "torchmetrics",
     "torchvision",
