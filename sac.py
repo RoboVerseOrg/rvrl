@@ -18,13 +18,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 import tyro
 from loguru import logger as log
+from tensordict import TensorDict, from_module
+from tensordict.nn import CudaGraphModule
 from torch import Tensor
 from torch.distributions import Independent, Normal, TanhTransform, TransformedDistribution
 from torch.utils.tensorboard.writer import SummaryWriter
+from torchmetrics import MeanMetric
 from tqdm import tqdm
 
 from rvrl.envs.env_factory import create_vector_env
+from rvrl.utils.metrics import MetricAggregator
 from rvrl.utils.reproducibility import enable_deterministic_run, seed_everything
+from rvrl.utils.timer import timer
 
 
 ########################################################
@@ -95,14 +100,16 @@ class ReplayBuffer:
         done = torch.as_tensor(flatten(self.done)[flattened_index], device=self.device)
         terminated = torch.as_tensor(flatten(self.terminated)[flattened_index], device=self.device)
 
-        sample = {
-            "observation": observation,
-            "action": action,
-            "reward": reward,
-            "next_observation": next_observation,
-            "done": done,
-            "terminated": terminated,
-        }
+        sample = TensorDict(
+            observation=observation,
+            action=action,
+            reward=reward,
+            next_observation=next_observation,
+            done=done,
+            terminated=terminated,
+            batch_size=observation.shape[0],
+            device=self.device,
+        )
         return sample
 
 
@@ -121,6 +128,8 @@ class Args:
     total_timesteps: int = 1000_000
     prefill: int = 5000
     log_every: int = 100
+    compile: bool = False
+    cudagraph: bool = False
 
     ## train
     batch_size: int = 256
@@ -181,7 +190,7 @@ class Actor(nn.Module):
         # return action, log_prob
 
 
-class Critic(nn.Module):
+class QNet(nn.Module):
     def __init__(self, env):
         super().__init__()
         self.qnet = nn.Sequential(
@@ -208,6 +217,12 @@ seed_everything(args.seed)
 if args.deterministic:
     enable_deterministic_run()
 
+## env and replay buffer
+envs = create_vector_env(args.env_id, "proprio", args.num_envs, args.seed)
+buffer = ReplayBuffer(
+    envs.single_observation_space.shape, envs.single_action_space.shape[0], device, args.num_envs, args.buffer_size
+)
+
 ## logger
 _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
@@ -219,36 +234,101 @@ writer.add_text(
     "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
 )
 
-## env and replay buffer
-envs = create_vector_env(args.env_id, "proprio", args.num_envs, args.seed)
-buffer = ReplayBuffer(
-    envs.single_observation_space.shape, envs.single_action_space.shape[0], device, args.num_envs, args.buffer_size
-)
-
 ## networks
 actor = Actor(envs).to(device)
-qf1 = Critic(envs).to(device)
-qf2 = Critic(envs).to(device)
-qf1_target = Critic(envs).to(device)
-qf2_target = Critic(envs).to(device)
+qf1 = QNet(envs).to(device)
+qf2 = QNet(envs).to(device)
+qf1_target = QNet(envs).to(device)
+qf2_target = QNet(envs).to(device)
 qf1_target.load_state_dict(qf1.state_dict())
 qf2_target.load_state_dict(qf2.state_dict())
+qf1_params = from_module(qf1).data
+qf2_params = from_module(qf2).data
+qf1_target_params = from_module(qf1_target).data
+qf2_target_params = from_module(qf2_target).data
 
 actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
 critic_optimizer = torch.optim.Adam(chain(qf1.parameters(), qf2.parameters()), lr=args.critic_lr)
 
+alpha = args.alpha  # TODO: implement automatic alpha tuning
+
+## Logging
+global_step = 0
+aggregator = MetricAggregator({
+    "loss/q1_loss": MeanMetric(),
+    "loss/q2_loss": MeanMetric(),
+    "loss/critic_loss": MeanMetric(),
+    "loss/actor_loss": MeanMetric(),
+    "state/q1_value": MeanMetric(),
+    "state/q2_value": MeanMetric(),
+})
+
+
+def update_q(data: dict[str, Tensor]) -> TensorDict:
+    obs = data["observation"]
+    action = data["action"]
+    next_obs = data["next_observation"]
+    reward = data["reward"]
+    terminated = data["terminated"]
+
+    with torch.no_grad():
+        next_action, next_log_prob = actor.get_action(next_obs)
+        qf1_next_target = qf1_target(next_obs, next_action)
+        qf2_next_target = qf2_target(next_obs, next_action)
+        min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_log_prob
+        next_q = reward + (1 - terminated) * args.gamma * min_qf_next_target
+
+    q1 = qf1(obs, action)
+    q2 = qf2(obs, action)
+    q1_loss = F.mse_loss(q1, next_q)
+    q2_loss = F.mse_loss(q2, next_q)
+    critic_loss = q1_loss + q2_loss
+    critic_optimizer.zero_grad()
+    critic_loss.backward()
+    critic_optimizer.step()
+
+    return TensorDict(
+        q1_loss=q1_loss.detach(),
+        q2_loss=q2_loss.detach(),
+        critic_loss=critic_loss.detach(),
+        q1_value=q1.detach().mean(),
+        q2_value=q2.detach().mean(),
+    )
+
+
+def update_actor(data: dict[str, Tensor]) -> TensorDict:
+    obs = data["observation"]
+    action, log_prob = actor.get_action(obs)
+    q1 = qf1(obs, action)
+    q2 = qf2(obs, action)
+    min_q = torch.min(q1, q2)
+    actor_loss = (alpha * log_prob - min_q).mean()
+    actor_optimizer.zero_grad()
+    actor_loss.backward()
+    actor_optimizer.step()
+
+    return TensorDict(actor_loss=actor_loss.detach())
+
+
+if args.compile:
+    update_q = torch.compile(update_q)
+    update_actor = torch.compile(update_actor)
+
+if args.cudagraph:
+    update_q = CudaGraphModule(update_q, in_keys=[], out_keys=[], warmup=5)
+    update_actor = CudaGraphModule(update_actor, in_keys=[], out_keys=[], warmup=5)
+
 
 def main():
-    global_step = 0
+    global global_step
     pbar = tqdm(total=args.total_timesteps, desc="Training")
     episodic_return = torch.zeros(args.num_envs, device=device)
     episodic_length = torch.zeros(args.num_envs, device=device)
 
     obs, _ = envs.reset(seed=args.seed)
-    alpha = args.alpha  # TODO: implement automatic alpha tuning
     while global_step < args.total_timesteps:
         ## Step the environment and add to buffer
-        with torch.inference_mode():
+        with torch.inference_mode(), timer("time/step"):
             if global_step < args.prefill:
                 action = torch.as_tensor(envs.action_space.sample(), device=device)
             else:
@@ -275,51 +355,36 @@ def main():
 
         ## Update the model
         if global_step >= args.prefill:
-            data = buffer.sample(args.batch_size)
-            with torch.no_grad():
-                next_action, next_log_prob = actor.get_action(data["next_observation"])
-                qf1_next_target = qf1_target(data["next_observation"], next_action)
-                qf2_next_target = qf2_target(data["next_observation"], next_action)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_log_prob
-                next_q = data["reward"] + (1 - data["terminated"]) * args.gamma * min_qf_next_target
+            with timer("time/train"):
+                with timer("time/data_sample"):
+                    data = buffer.sample(args.batch_size)
+                with timer("time/update_model"):
+                    metrics = update_q(data)
+                    if global_step % args.policy_frequency == 0:
+                        metrics.update(update_actor(data))
+                    if global_step % args.target_network_frequency == 0:
+                        qf1_target_params.lerp_(qf1_params.data, args.tau)
+                        qf2_target_params.lerp_(qf2_params.data, args.tau)
 
-            q1 = qf1(data["observation"], data["action"])
-            q2 = qf2(data["observation"], data["action"])
-            q1_loss = F.mse_loss(q1, next_q)
-            q2_loss = F.mse_loss(q2, next_q)
-            critic_loss = q1_loss + q2_loss
-            critic_optimizer.zero_grad()
-            critic_loss.backward()
-            critic_optimizer.step()
-
-            if global_step % args.policy_frequency == 0:
-                for _ in range(args.policy_frequency):
-                    action, log_prob = actor.get_action(data["observation"])
-                    q1 = qf1(data["observation"], action)
-                    q2 = qf2(data["observation"], action)
-                    min_q = torch.min(q1, q2)
-                    actor_loss = (alpha * log_prob - min_q).mean()
-                    actor_optimizer.zero_grad()
-                    actor_loss.backward()
-                    actor_optimizer.step()
-
-            ## Target network update
-            if global_step % args.target_network_frequency == 0:
-                for target_param, param in zip(qf1_target.parameters(), qf1.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
-                for target_param, param in zip(qf2_target.parameters(), qf2.parameters()):
-                    target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
+            with torch.no_grad(), timer("time/update_metrics"):
+                aggregator.update("loss/q1_loss", metrics["q1_loss"].item())
+                aggregator.update("loss/q2_loss", metrics["q2_loss"].item())
+                aggregator.update("loss/critic_loss", metrics["critic_loss"].item())
+                if "actor_loss" in metrics:
+                    aggregator.update("loss/actor_loss", metrics["actor_loss"].item())
+                aggregator.update("state/q1_value", metrics["q1_value"].item())
+                aggregator.update("state/q2_value", metrics["q2_value"].item())
 
         # Logging
         if global_step > args.prefill and global_step % args.log_every < args.num_envs:
-            writer.add_scalar("loss/q1_loss", q1_loss.item(), global_step)
-            writer.add_scalar("loss/q2_loss", q2_loss.item(), global_step)
-            writer.add_scalar("loss/critic_loss", critic_loss.item(), global_step)
-            if "actor_loss" in locals():
-                writer.add_scalar("loss/actor_loss", actor_loss.item(), global_step)
-            writer.add_scalar("loss/alpha", alpha, global_step)
-            writer.add_scalar("state/q1_value", q1.mean().item(), global_step)
-            writer.add_scalar("state/q2_value", q2.mean().item(), global_step)
+            for k, v in aggregator.compute().items():
+                writer.add_scalar(k, v, global_step)
+            aggregator.reset()
+
+            if not timer.disabled:
+                for k, v in timer.compute().items():
+                    writer.add_scalar(k, v, global_step)
+                timer.reset()
 
         global_step += args.num_envs
         pbar.update(args.num_envs)
