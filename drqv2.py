@@ -290,107 +290,103 @@ class QNet(nn.Module):
 ########################################################
 ## Main
 ########################################################
-
-## setup
-device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
-seed_everything(args.seed)
-if args.deterministic:
-    enable_deterministic_run()
-
-## env and replay buffer
-envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2)
-buffer = ReplayBuffer(
-    envs.single_observation_space.shape, envs.single_action_space.shape[0], device, args.num_envs, args.buffer_size
-)
-
-## logger
-_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
-logdir = f"logdir/{run_name}"
-os.makedirs(logdir, exist_ok=True)
-writer = SummaryWriter(logdir)
-writer.add_text(
-    "hyperparameters",
-    "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-)
-
-## networks
-aug = RandomShiftsAug(pad=4)
-encoder = Encoder().to(device)
-qf = QNet(envs).to(device)
-qf_target = QNet(envs).to(device)
-qf_target.load_state_dict(qf.state_dict())
-qf_params = from_module(qf).data
-qf_target_params = from_module(qf_target).data
-actor = Actor(envs).to(device)
-
-qf_optimizer = torch.optim.Adam(qf.parameters(), lr=args.q_lr)
-actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
-encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=args.encoder_lr)
-
-## logging
-global_step = 0
-aggregator = MetricAggregator({
-    "loss/q_loss": MeanMetric(),
-    "loss/actor_loss": MeanMetric(),
-    "state/q_value": MeanMetric(),
-})
-
-
-def update_model(data: dict[str, Tensor]) -> TensorDict:
-    obs = data["observation"]
-    action = data["action"]
-    reward = data["reward"]
-    next_obs = data["next_observation"]
-    terminated = data["terminated"]
-
-    obs = encoder(aug(obs))
-    with torch.no_grad():
-        next_obs = encoder(aug(next_obs))
-
-    ## Update Q-function
-    with torch.no_grad():
-        std = 0.3  # TODO: use schedule
-        next_action_dist = actor(next_obs, std)
-        next_action = next_action_dist.sample(clip=0.3)
-        q1_target, q2_target = qf_target(next_obs, next_action)
-        q_target = reward + (1 - terminated) * args.gamma * torch.min(q1_target, q2_target)
-
-    q1, q2 = qf(obs, action)
-    q_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
-    encoder_optimizer.zero_grad()
-    qf_optimizer.zero_grad()
-    q_loss.backward()
-    qf_optimizer.step()
-    encoder_optimizer.step()
-
-    ## Update Actor
-    obs = obs.detach()
-    std = 0.3  # TODO: use schedule
-    action_dist = actor(obs, std)
-    action = action_dist.sample(clip=0.3)
-    q1, q2 = qf(obs, action)
-    q = torch.min(q1, q2)
-
-    actor_loss = -q.mean()
-    actor_optimizer.zero_grad()
-    actor_loss.backward()
-    actor_optimizer.step()
-
-    qf_target_params.lerp_(qf_params.data, args.tau)
-
-    return TensorDict(q_loss=q_loss.detach(), q_value=q.detach().mean(), actor_loss=actor_loss.detach())
-
-
-if args.compile:
-    update_model = torch.compile(update_model)
-if args.cudagraph:
-    update_model = CudaGraphModule(update_model, in_keys=[], out_keys=[], warmup=5)
-
-
 def main():
-    global global_step
+    ## setup
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    log.info(f"Using device: {device}" + (f" (GPU {torch.cuda.current_device()})" if torch.cuda.is_available() else ""))
+    seed_everything(args.seed)
+    if args.deterministic:
+        enable_deterministic_run()
+
+    ## env and replay buffer
+    envs = create_vector_env(args.env_id, "rgb", args.num_envs, args.seed, action_repeat=2)
+    buffer = ReplayBuffer(
+        envs.single_observation_space.shape, envs.single_action_space.shape[0], device, args.num_envs, args.buffer_size
+    )
+
+    ## logger
+    _timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"{args.env_id}__{args.exp_name}__env={args.num_envs}__seed={args.seed}__{_timestamp}"
+    logdir = f"logdir/{run_name}"
+    os.makedirs(logdir, exist_ok=True)
+    writer = SummaryWriter(logdir)
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
+
+    ## networks
+    aug = RandomShiftsAug(pad=4)
+    encoder = Encoder().to(device)
+    qf = QNet(envs).to(device)
+    qf_target = QNet(envs).to(device)
+    qf_target.load_state_dict(qf.state_dict())
+    qf_params = from_module(qf).data
+    qf_target_params = from_module(qf_target).data
+    actor = Actor(envs).to(device)
+
+    qf_optimizer = torch.optim.Adam(qf.parameters(), lr=args.q_lr)
+    actor_optimizer = torch.optim.Adam(actor.parameters(), lr=args.actor_lr)
+    encoder_optimizer = torch.optim.Adam(encoder.parameters(), lr=args.encoder_lr)
+
+    ## logging
+    aggregator = MetricAggregator({
+        "loss/q_loss": MeanMetric(),
+        "loss/actor_loss": MeanMetric(),
+        "state/q_value": MeanMetric(),
+    })
+
+    def update_model(data: dict[str, Tensor]) -> TensorDict:
+        obs = data["observation"]
+        action = data["action"]
+        reward = data["reward"]
+        next_obs = data["next_observation"]
+        terminated = data["terminated"]
+
+        obs = encoder(aug(obs))
+        with torch.no_grad():
+            next_obs = encoder(aug(next_obs))
+
+        ## Update Q-function
+        with torch.no_grad():
+            std = 0.3  # TODO: use schedule
+            next_action_dist = actor(next_obs, std)
+            next_action = next_action_dist.sample(clip=0.3)
+            q1_target, q2_target = qf_target(next_obs, next_action)
+            q_target = reward + (1 - terminated) * args.gamma * torch.min(q1_target, q2_target)
+
+        q1, q2 = qf(obs, action)
+        q_loss = F.mse_loss(q1, q_target) + F.mse_loss(q2, q_target)
+        encoder_optimizer.zero_grad()
+        qf_optimizer.zero_grad()
+        q_loss.backward()
+        qf_optimizer.step()
+        encoder_optimizer.step()
+
+        ## Update Actor
+        obs = obs.detach()
+        std = 0.3  # TODO: use schedule
+        action_dist = actor(obs, std)
+        action = action_dist.sample(clip=0.3)
+        q1, q2 = qf(obs, action)
+        q = torch.min(q1, q2)
+
+        actor_loss = -q.mean()
+        actor_optimizer.zero_grad()
+        actor_loss.backward()
+        actor_optimizer.step()
+
+        qf_target_params.lerp_(qf_params.data, args.tau)
+
+        return TensorDict(q_loss=q_loss.detach(), q_value=q.detach().mean(), actor_loss=actor_loss.detach())
+
+    if args.compile:
+        update_model = torch.compile(update_model)
+    if args.cudagraph:
+        update_model = CudaGraphModule(update_model, in_keys=[], out_keys=[], warmup=5)
+
+    ## main loop
+    global_step = 0
     pbar = tqdm(total=args.total_timesteps, desc="Training")
     episodic_return = torch.zeros(args.num_envs, device=device)
     episodic_length = torch.zeros(args.num_envs, device=device)
