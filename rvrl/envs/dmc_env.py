@@ -118,7 +118,7 @@ class DMControlRgbEnv(gym.Env):
         action = action.astype(np.float32)
         return action
 
-    def reset(self) -> tuple[np.ndarray, dict]:
+    def reset(self, seed: int | None = None, options: Any | None = None) -> tuple[np.ndarray, dict]:
         self.env.reset()
         obs = self.env.physics.render(width=self.width, height=self.height, camera_id=self._camera_id)
         obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
