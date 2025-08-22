@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 from loguru import logger as log
-from torchmetrics import Metric
+from torchmetrics import MeanMetric, Metric
 
 
 class MetricAggregator:
@@ -18,11 +18,10 @@ class MetricAggregator:
 
     disabled: bool = False
 
-    def __init__(self, metrics: dict[str, Metric] | None = None, raise_on_missing: bool = False):
+    def __init__(self, metrics: dict[str, Metric] | None = None):
         self.metrics: dict[str, Metric] = {}
         if metrics is not None:
             self.metrics = metrics
-        self._raise_on_missing = raise_on_missing
 
     def __iter__(self):
         return iter(self.metrics.keys())
@@ -40,14 +39,8 @@ class MetricAggregator:
         """
         if not self.disabled:
             if name not in self.metrics:
-                if self._raise_on_missing:
-                    raise ValueError(f"Metric {name} does not exist")
-                else:
-                    log.warning(
-                        f"The key '{name}' is missing from the metric aggregator. Nothing will be added.", UserWarning
-                    )
-            else:
-                self.metrics[name].update(value)
+                self.metrics[name] = MeanMetric()
+            self.metrics[name].update(value)
 
     def reset(self):
         """Reset all metrics to their initial state"""

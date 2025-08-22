@@ -115,3 +115,7 @@ class NumpyToTorch:
     @property
     def single_action_space(self):
         return self.env.single_action_space
+
+    @property
+    def num_envs(self) -> int:
+        return self.env.num_envs
