@@ -22,7 +22,7 @@ class ManiskillVecEnv(BaseVecEnv):
         num_envs: int,
         seed: int,
         device: str | torch.device,
-        obs_mode: Literal["rgb", "proprio"],
+        obs_mode: Literal["rgb", "state"],
         image_size: tuple[int, int] | None = None,
     ):
         self.env = gym.make(

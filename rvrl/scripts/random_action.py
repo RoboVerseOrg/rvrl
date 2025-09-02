@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+
+os.environ["MUJOCO_GL"] = "egl"
+
 import imageio as iio
 import numpy as np
 import torch
@@ -30,14 +34,14 @@ class VideoWriter:
 
 
 def main(env_id: str = "maniskill/TurnFaucet-v1", image_size: tuple[int, int] = (64, 64)):
-    env = create_vector_env(env_id, num_envs=1, seed=0, device="cuda", obs_type="rgb", image_size=image_size)
+    env = create_vector_env(env_id, num_envs=1, seed=0, device="cuda", obs_mode="both", image_size=image_size)
     obs, _ = env.reset()
     video_writer = VideoWriter(f"random_action_{env_id.replace('/', '_')}.mp4")
-    video_writer.add(obs)
+    video_writer.add(obs["rgb"])
     for _ in range(100):
         action = torch.randn(env.action_space.shape)
         obs, _, _, _, _ = env.step(action)
-        video_writer.add(obs)
+        video_writer.add(obs["rgb"])
     video_writer.save()
     env.close()
 

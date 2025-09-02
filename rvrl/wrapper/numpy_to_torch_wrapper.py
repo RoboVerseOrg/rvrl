@@ -9,11 +9,14 @@ import torch
 Device = Union[str, torch.device]
 
 
-def numpy_to_torch(x: np.ndarray, device: Device | None = None) -> torch.Tensor:
-    if device is None:
-        return torch.from_numpy(x).float()
+def numpy_to_torch(x: np.ndarray | dict[str, np.ndarray], device: Device | None = None) -> torch.Tensor:
+    if isinstance(x, dict):
+        return {k: numpy_to_torch(v, device) for k, v in x.items()}
     else:
-        return torch.from_numpy(x).float().to(device)
+        if device is None:
+            return torch.from_numpy(x).float()
+        else:
+            return torch.from_numpy(x).float().to(device)
 
 
 def torch_to_numpy(x: torch.Tensor) -> np.ndarray:
@@ -99,6 +102,9 @@ class NumpyToTorch:
 
     def render(self) -> None:
         raise NotImplementedError
+
+    def close(self):
+        self.env.close()
 
     @property
     def observation_space(self):

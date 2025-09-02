@@ -16,7 +16,6 @@ class IsaacLabEnv(BaseVecEnv):
         env_cfg = parse_env_cfg(task_name, device="cuda", num_envs=num_envs)
         env_cfg.seed = seed
         self.envs = gym.make(task_name, cfg=env_cfg, render_mode=None)
-        print(self.envs.unwrapped.max_episode_length)
 
     def reset(self, seed: int | None = None, options: Any | None = None):
         obs, extra = self.envs.reset(seed=seed, options=options)

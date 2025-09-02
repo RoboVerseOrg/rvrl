@@ -18,10 +18,14 @@ class MetricAggregator:
 
     disabled: bool = False
 
-    def __init__(self, metrics: dict[str, Metric] | None = None):
+    def __init__(self, metrics: dict[str, Metric] | None = None, device: str | torch.device = "cpu"):
         self.metrics: dict[str, Metric] = {}
+        self.device = device
+
         if metrics is not None:
             self.metrics = metrics
+            for k, v in self.metrics.items():
+                self.metrics[k] = v.to(self.device)
 
     def __iter__(self):
         return iter(self.metrics.keys())
@@ -39,7 +43,7 @@ class MetricAggregator:
         """
         if not self.disabled:
             if name not in self.metrics:
-                self.metrics[name] = MeanMetric()
+                self.metrics[name] = MeanMetric().to(self.device)
             self.metrics[name].update(value)
 
     def reset(self):
@@ -47,17 +51,6 @@ class MetricAggregator:
         if not self.disabled:
             for metric in self.metrics.values():
                 metric.reset()
-
-    def to(self, device: str | torch.device = "cpu") -> MetricAggregator:
-        """Move all metrics to the given device
-        Args:
-            device (str |torch.device, optional): Device to move the metrics to. Defaults to "cpu".
-        """
-        if not self.disabled:
-            if self.metrics:
-                for k, v in self.metrics.items():
-                    self.metrics[k] = v.to(device)
-        return self
 
     @torch.no_grad()
     def compute(self) -> dict[str, Any]:

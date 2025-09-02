@@ -70,7 +70,6 @@ class Args:
     total_timesteps: int = 1000000
     anneal_lr: bool = True
     device: str = "cuda"  # Device for IsaacLab environments
-    capture_video: bool = False  # Whether to record video
     window_size: int = 100
 
 
@@ -134,11 +133,9 @@ def main():
     # Use the unified environment interface
     envs = create_vector_env(
         args.env_id,
-        "proprio",
+        "state",
         args.num_envs,
         args.seed,
-        capture_video=args.capture_video,
-        run_name=run_name,
         device=args.device,
     )
 

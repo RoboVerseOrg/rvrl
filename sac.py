@@ -218,7 +218,7 @@ if args.deterministic:
     enable_deterministic_run()
 
 ## env and replay buffer
-envs = create_vector_env(args.env_id, "proprio", args.num_envs, args.seed)
+envs = create_vector_env(args.env_id, "state", args.num_envs, args.seed)
 buffer = ReplayBuffer(
     envs.single_observation_space.shape, envs.single_action_space.shape[0], device, args.num_envs, args.buffer_size
 )

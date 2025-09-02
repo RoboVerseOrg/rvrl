@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Literal
 
 import gymnasium as gym
 import numpy as np
@@ -56,51 +56,23 @@ _DEFAULT_CAMERA_ID = {
 }
 
 
-class DMControlProprioEnv(gym.Env):
-    def __init__(self, env_id: str, seed: int, action_repeat: int = 1):
+class DMControlEnv(gym.Env):
+    def __init__(
+        self,
+        env_id: str,
+        seed: int,
+        image_size: tuple[int, int],
+        obs_mode: Literal["rgb", "state", "both"],
+        action_repeat: int = 1,
+    ):
         domain_name = env_id.split("-")[0]
         task_name = env_id.split("-")[1]
         self.env = suite.load(domain_name, task_name, task_kwargs={"random": seed})
+        self.width = image_size[0]
+        self.height = image_size[1]
         self.action_repeat = action_repeat
-        self.observation_space = dm_spec2gym_space(self.env.observation_spec())
-        self.action_space = dm_spec2gym_space(self.env.action_spec())
-        print(f"{self.observation_space=}")
-        print(f"{self.action_space=}")
-
-    def reset(self, seed: int | None = None, options: Any | None = None) -> tuple[np.ndarray, dict]:
-        timestep = self.env.reset()
-        obs = timestep.observation
-        return obs, {}
-
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
-        reward = 0
-        for _ in range(self.action_repeat):
-            timestep = self.env.step(action)
-            reward += timestep.reward
-            done = timestep.last()
-            if done:
-                break
-        truncated = timestep.last() and timestep.discount == 1.0
-        terminated = timestep.last() and timestep.discount == 0.0
-        obs = timestep.observation
-        return obs, reward, terminated, truncated, {}
-
-    def render(self):
-        raise NotImplementedError
-
-    def close(self):
-        pass
-
-
-class DMControlRgbEnv(gym.Env):
-    def __init__(self, env_id: str, seed: int, width: int = 64, height: int = 64, action_repeat: int = 1):
-        domain_name = env_id.split("-")[0]
-        task_name = env_id.split("-")[1]
-        self.env = suite.load(domain_name, task_name, task_kwargs={"random": seed})
-        self.width = width
-        self.height = height
-        self.action_repeat = action_repeat
-        self._obs_space = spaces.Box(low=0, high=1, shape=(3, self.width, self.height), dtype=np.float32)
+        self.obs_mode = obs_mode
+        self._obs_space = self._get_obs_space(dm_spec2gym_space(self.env.observation_spec()))
         self._true_action_space = dm_spec2gym_space(self.env.action_spec())
         self._norm_action_space = spaces.Box(low=-1, high=1, shape=self._true_action_space.shape, dtype=np.float32)
 
@@ -118,11 +90,28 @@ class DMControlRgbEnv(gym.Env):
         action = action.astype(np.float32)
         return action
 
-    def reset(self) -> tuple[np.ndarray, dict]:
-        self.env.reset()
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=self._camera_id)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
-        return obs, {}
+    def _get_obs_space(self, original_obs_space: spaces.Space) -> spaces.Space:
+        if self.obs_mode == "state":
+            return original_obs_space
+        rgb_obs_space = spaces.Box(low=0, high=1, shape=(3, self.width, self.height), dtype=np.float32)
+        if self.obs_mode == "rgb":
+            return rgb_obs_space
+        elif self.obs_mode == "both":
+            return spaces.Dict({"rgb": rgb_obs_space, "state": original_obs_space})
+
+    def _get_obs(self, timestep) -> np.ndarray | dict[str, np.ndarray]:
+        if self.obs_mode == "state":
+            return timestep.observation
+        rgb = self.env.physics.render(width=self.width, height=self.height, camera_id=self._camera_id)
+        rgb = np.transpose(rgb, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
+        if self.obs_mode == "rgb":
+            return rgb
+        elif self.obs_mode == "both":
+            return {"rgb": rgb, "state": timestep.observation}
+
+    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:
+        timestep = self.env.reset()
+        return self._get_obs(timestep), {}
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         action = self._convert_action(action)
@@ -135,9 +124,7 @@ class DMControlRgbEnv(gym.Env):
                 break
         truncated = timestep.last() and timestep.discount == 1.0
         terminated = timestep.last() and timestep.discount == 0.0
-        obs = self.env.physics.render(width=self.width, height=self.height, camera_id=self._camera_id)
-        obs = np.transpose(obs, (2, 0, 1)).copy() / 255.0  # (H, W, 3) -> (3, H, W)
-        return obs, reward, terminated, truncated, {}
+        return self._get_obs(timestep), reward, terminated, truncated, {}
 
     def render(self):
         raise NotImplementedError

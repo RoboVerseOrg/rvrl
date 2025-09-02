@@ -14,75 +14,52 @@ SEED_SPACING = 1_000_000
 
 def create_vector_env(
     env_id: str,
-    obs_type: Literal["rgb", "proprio"],
+    obs_mode: Literal["rgb", "state", "both"],
     num_envs: int,
     seed: int,
     action_repeat: int = 1,
     image_size: tuple[int, int] = (64, 64),
-    capture_video: bool = False,
-    run_name: str = "",
     device: str = "cuda",
-    **kwargs,
 ) -> BaseVecEnv:
     """
     Create a vectorized environment.
 
     Args:
         env_id: Environment identifier
-        obs_type: Observation type
+        obs_mode: Observation type
         num_envs: Number of parallel environments
         seed: Seed for the environment
         action_repeat: Action repeat for the environment
-        image_size: Image size for RGB observation. Only used when :param:`obs_type` is "rgb". Type is (width, height) tuple.
-        capture_video: Whether to record video
-        run_name: Name for video recording
+        image_size: Image size for RGB observation. Only used when :param:`obs_mode` is "rgb". Type is (width, height) tuple.
         device: Device to run on (for IsaacLab)
-        **kwargs: Additional environment arguments
 
     Returns:
         Vectorized environment
     """
     if env_id.startswith("dm_control/"):
-        if obs_type == "proprio":
-            from .dmc_env import DMControlProprioEnv
+        from .dmc_env import DMControlEnv
 
-            env_fns = [
-                lambda: gym.wrappers.FlattenObservation(
-                    DMControlProprioEnv(
-                        env_id.replace("dm_control/", ""),
-                        seed + i * SEED_SPACING,
-                        action_repeat=action_repeat,
-                    )
-                )
-                for i in range(num_envs)
-            ]
-            envs = gym.vector.SyncVectorEnv(env_fns)
-            envs = NumpyToTorch(envs, device)
-            return envs
-        elif obs_type == "rgb":
-            from .dmc_env import DMControlRgbEnv
-
-            env_fns = [
-                lambda: DMControlRgbEnv(
-                    env_id.replace("dm_control/", ""),
-                    seed + i * SEED_SPACING,
-                    width=image_size[0],
-                    height=image_size[1],
-                    action_repeat=action_repeat,
-                )
-                for i in range(num_envs)
-            ]
-            envs = gym.vector.SyncVectorEnv(env_fns)
-            envs = NumpyToTorch(envs, device)
-            return envs
-        else:
-            raise ValueError(f"Unknown observation type: {obs_type}")
+        env_fns = [
+            lambda: DMControlEnv(
+                env_id.replace("dm_control/", ""),
+                seed + i * SEED_SPACING,
+                image_size,
+                obs_mode,
+                action_repeat=action_repeat,
+            )
+            for i in range(num_envs)
+        ]
+        if obs_mode == "state":
+            env_fns = [lambda: gym.wrappers.FlattenObservation(func()) for func in env_fns]
+        envs = gym.vector.SyncVectorEnv(env_fns)
+        envs = NumpyToTorch(envs, device)
+        return envs
     elif env_id.startswith("humanoid_bench/"):
         from .humanoid_bench_env import HumanoidBenchEnv
 
         env_fns = [
             lambda: HumanoidBenchEnv(
-                env_id.replace("humanoid_bench/", ""), seed + i * SEED_SPACING, image_size, obs_type
+                env_id.replace("humanoid_bench/", ""), seed + i * SEED_SPACING, image_size, obs_mode
             )
             for i in range(num_envs)
         ]
@@ -97,7 +74,8 @@ def create_vector_env(
     elif env_id.startswith("isaacgymenv/"):
         from .isaacgym_env import IsaacGymEnv
 
-        envs = IsaacGymEnv(env_id, num_envs, seed=seed)
+        assert obs_mode == "state", "isaacgymenv only supports state observation"
+        envs = IsaacGymEnv(env_id.replace("isaacgymenv/", ""), num_envs, seed, device)
         return envs
     elif env_id.startswith("gym/"):  # gymnasium native envs
 
@@ -117,7 +95,7 @@ def create_vector_env(
     elif env_id.startswith("maniskill/"):
         from .maniskill_env import ManiskillVecEnv
 
-        envs = ManiskillVecEnv(env_id.replace("maniskill/", ""), num_envs, seed, device, obs_type, image_size)
+        envs = ManiskillVecEnv(env_id.replace("maniskill/", ""), num_envs, seed, device, obs_mode, image_size)
         return envs
     else:
         raise ValueError(f"Unknown environment: {env_id}")

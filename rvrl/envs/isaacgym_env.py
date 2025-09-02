@@ -12,9 +12,15 @@ from rvrl.envs import BaseVecEnv
 
 
 class IsaacGymEnv(BaseVecEnv):
-    def __init__(self, task_name: str, num_envs: int = 1, seed: int = 0, device: str = "cuda"):
+    def __init__(
+        self,
+        task_name: str,
+        num_envs: int,
+        seed: int,
+        device: str,
+    ):
         with hydra.initialize(config_path="../../third_party/IsaacGymEnvs/isaacgymenvs/cfg"):
-            cfg = hydra.compose(config_name="config", overrides=[f"task={task_name.replace('isaacgymenv/', '')}"])
+            cfg = hydra.compose(config_name="config", overrides=[f"task={task_name}"])
         cfg.task.env.numEnvs = num_envs
         cfg.sim_device = device
         cfg.rl_device = device
@@ -41,13 +47,24 @@ class IsaacGymEnv(BaseVecEnv):
     def render(self):
         raise NotImplementedError
 
+    def close(self):
+        pass
+
     @property
     def single_observation_space(self):
-        return self.envs.observation_space
+        return self.envs.observation_space  # NOTE: yes, isaacgym's observation_space is for single env
+
+    @property
+    def observation_space(self):
+        return self.envs.observation_space  # FIXME
 
     @property
     def single_action_space(self):
-        return self.envs.action_space
+        return self.envs.action_space  # NOTE: yes, isaacgym's action_space is for single env
+
+    @property
+    def action_space(self):
+        return self.envs.action_space  # FIXME
 
     @property
     def num_envs(self) -> int:
