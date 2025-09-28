@@ -14,6 +14,9 @@ python ppo.py --env-id=isaacgymenv/Cartpole --seed 2 --num-envs=512 --lr=3e-4 --
 ## IsaacLab Tasks
 python ppo.py --env-id=isaaclab/Isaac-Reach-Franka-v0 --seed 1 --num-envs=32 --lr=1e-3 --num_steps=360 --total_timesteps=3000000
 
+## RoboVerse Tasks
+python ppo.py --env-id=roboverse/reach_origin --num-envs=2048 --num-steps=64 --total-timesteps=10000000
+
 
 ########################
 ## SAC

@@ -8,6 +8,17 @@ conda create -n rvrl python=3.11 -y && conda activate rvrl
 uv pip install -e ".[dmc,maniskill]"
 ```
 
+RoboVerse environment:
+```bash
+conda create -n rvrl_rv python=3.11 -y && conda activate rvrl_rv
+cd third_party
+git clone https://github.com/RoboVerseOrg/RoboVerse && cd RoboVerse
+git checkout 8952c9a  # ensure compatibility
+uv pip install -e ".[mjx]" "jax[cuda]==0.6.2"
+cd ../..
+uv pip install -e .
+```
+
 Humanoid-bench environment:
 ```bash
 conda activate rvrl
