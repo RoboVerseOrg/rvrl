@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import copy
 
 TensorArray = torch.Tensor | np.ndarray
 
@@ -20,6 +21,7 @@ class Logger:
         self._step = init_step
 
     def add(self, mapping: dict[str, Any]):
+        assert isinstance(mapping, dict), "logger.add() only takes a dict"
         if not mapping:
             return
         self._metrics += [(self.step, name, value) for name, value in mapping.items()]
@@ -29,7 +31,7 @@ class Logger:
             return
         for output in self._outputs:
             output.write(self._metrics)
-        self._metrics.clear()
+        self._metrics = []
 
     def close(self):
         self.write()
@@ -86,7 +88,7 @@ class AsyncOutput(BaseOutput):
     def write(self, summaries):
         if self._parallel:
             self._future and self._future.result()
-            self._future = self._worker.submit(self._callback, summaries)
+            self._future = self._worker.submit(self._callback, copy.deepcopy(summaries))
         else:
             self._callback(summaries)
 

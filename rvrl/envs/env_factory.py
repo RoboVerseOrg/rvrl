@@ -8,6 +8,7 @@ import gymnasium as gym
 
 from rvrl.envs import BaseVecEnv
 from rvrl.wrapper.numpy_to_torch_wrapper import NumpyToTorch
+from rvrl.wrapper.sync_vector_set_state_wrapper import SyncVectorSetStateWrapper
 
 SEED_SPACING = 1_000_000
 
@@ -51,7 +52,8 @@ def create_vector_env(
         ]
         if obs_mode == "state":
             env_fns = [lambda: gym.wrappers.FlattenObservation(func()) for func in env_fns]
-        envs = gym.vector.SyncVectorEnv(env_fns)
+        # envs = gym.vector.SyncVectorEnv(env_fns)
+        envs = SyncVectorSetStateWrapper(env_fns)
         envs = NumpyToTorch(envs, device)
         return envs
     elif env_id.startswith("humanoid_bench/"):
@@ -96,6 +98,11 @@ def create_vector_env(
         from .maniskill_env import ManiskillVecEnv
 
         envs = ManiskillVecEnv(env_id.replace("maniskill/", ""), num_envs, seed, device, obs_mode, image_size)
+        return envs
+    elif env_id.startswith("roboverse/"):
+        from .roboverse_env import RoboverseEnv
+
+        envs = RoboverseEnv(env_id.replace("roboverse/", ""), num_envs, seed, device, obs_mode, image_size)
         return envs
     else:
         raise ValueError(f"Unknown environment: {env_id}")

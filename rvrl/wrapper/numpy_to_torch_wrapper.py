@@ -100,6 +100,13 @@ class NumpyToTorch:
         obs, extra = self.env.reset(seed=seed, options=options)
         return numpy_to_torch(obs, self.device), extra
 
+    def set_state(self, state: torch.Tensor, index: torch.Tensor | None = None) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Sets the state of the environment and returns the observation and info."""
+        if index is not None:
+            index = torch_to_numpy(index)
+        state = torch_to_numpy(state)
+        self.env.set_state(state, index)
+
     def render(self) -> None:
         raise NotImplementedError
 

@@ -76,6 +76,9 @@ class DMControlEnv(gym.Env):
         self._true_action_space = dm_spec2gym_space(self.env.action_spec())
         self._norm_action_space = spaces.Box(low=-1, high=1, shape=self._true_action_space.shape, dtype=np.float32)
 
+        self._raw_state_space = spaces.Box(low=-1, high=1, shape=self.env.physics.get_state().shape, dtype=np.float32)
+        self._obs_space["raw_state"] = self._raw_state_space
+
         self._obs_space.seed(seed)
         self._true_action_space.seed(seed)
         self._norm_action_space.seed(seed)
@@ -107,11 +110,19 @@ class DMControlEnv(gym.Env):
         if self.obs_mode == "rgb":
             return rgb
         elif self.obs_mode == "both":
-            return {"rgb": rgb, "state": timestep.observation}
+            # NOTE: add raw_state to obs to support set_state
+            return {
+                "rgb": rgb,
+                "state": timestep.observation,
+                "raw_state": self.env.physics.get_state(),
+            }
 
     def reset(self, seed: int | None = None, options: dict[str, Any] | None = None) -> tuple[np.ndarray, dict]:
         timestep = self.env.reset()
         return self._get_obs(timestep), {}
+
+    def set_state(self, state: np.ndarray):
+        self.env.physics.set_state(state)
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
         action = self._convert_action(action)
